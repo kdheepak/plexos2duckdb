@@ -1,0 +1,44 @@
+[package]
+name = "plexos2duckdb"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "A tool to convert PLEXOS Solution files to a DuckDB database."
+license = "BSD-3-Clause"
+repository = "https://github.com/epri-dev/plexos2duckdb"
+homepage = "https://github.com/epri-dev/plexos2duckdb"
+documentation = "https://github.com/epri-dev/plexos2duckdb"
+readme = "README.md"
+
+[dependencies]
+chrono = "0.4.42"
+clap = { version = "4.5.50", features = ["derive"] }
+color-eyre = "0.6.5"
+dateparser = "0.2.1"
+duckdb = { version = "1.2.2", features = ["bundled", "chrono"] }
+indexmap = "2.12.0"
+itertools = "0.14.0"
+lazy_static = "1.5.0"
+memmap2 = "0.9.9"
+regex = "1.11.1"
+roxmltree = "0.21.1"
+tempfile = "3.23.0"
+zip = "6.0.0"
+
+[profile.release]
+debug = "full"
+
+[[bin]]
+name = "plexos2duckdb"
+path = "src/main.rs"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+
+[build-dependencies]
+vergen-gitcl = { version = "1.0.8", features = [
+  "build",
+  "cargo",
+  "rustc",
+  "si",
+] }
