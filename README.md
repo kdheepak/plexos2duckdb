@@ -1,5 +1,10 @@
 # plexos2duckdb
 
+[![Release](https://img.shields.io/github/v/release/epri-dev/plexos2duckdb)](https://github.com/epri-dev/plexos2duckdb/releases)
+[![License](https://img.shields.io/github/license/epri-dev/plexos2duckdb)](https://github.com/epri-dev/plexos2duckdb/blob/main/LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20MacOS%20%7C%20Linux-blue)]()
+[![Downloads](https://img.shields.io/github/downloads/epri-dev/plexos2duckdb/total?color=brightgreen)](https://github.com/epri-dev/plexos2duckdb/releases)
+
 This is a command line tool to convert PLEXOS output files to a DuckDB database.
 
 ## Installation
