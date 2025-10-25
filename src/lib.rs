@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#![doc = include_str!("../README.md")]
+
 use std::io::Read as _;
 
 use color_eyre::{Result, eyre::eyre};
