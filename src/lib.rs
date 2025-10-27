@@ -126,7 +126,7 @@ struct Period4 {
 
 #[derive(Debug, Clone)]
 struct Period6 {
-    day_id: i64,
+    hour_id: i64,
     datetime: chrono::DateTime<chrono::Utc>,
 }
 
@@ -916,11 +916,11 @@ impl SolutionDataset {
 
     fn parse_period6(&mut self, node: &Node) -> Result<()> {
         for period_node in node.children().filter(|n| n.has_tag_name("t_period_6")) {
-            let day_id = get_child(&period_node, "day_id")?;
+            let hour_id = get_child(&period_node, "hour_id")?;
             let datetime: String = get_child(&period_node, "datetime")?;
             let datetime = parse_datetime_to_utc(&datetime)?;
-            let period6 = Period6 { day_id, datetime };
-            self.period.entry("hour".to_string()).or_default().insert(period6.day_id, PeriodType::Hour(period6));
+            let period6 = Period6 { hour_id, datetime };
+            self.period.entry("hour".to_string()).or_default().insert(period6.hour_id, PeriodType::Hour(period6));
         }
         self.period.entry("hour".to_string()).or_default().sort_keys();
         Ok(())
