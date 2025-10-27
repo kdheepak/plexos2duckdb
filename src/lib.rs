@@ -1783,10 +1783,10 @@ impl SolutionDataset {
                 "
                 CREATE TABLE data.\"{table_name}\" (
                   key_id INTEGER,
-                  sample_id INTEGER, -- dimension 1
-                  band_id INTEGER, -- dimension 2
-                  membership_id INTEGER, -- dimension 3
-                  block_id INTEGER, -- dimension 4
+                  sample_id INTEGER,
+                  band_id INTEGER,
+                  membership_id INTEGER,
+                  block_id INTEGER,
                   value DOUBLE,
                 )
               ",
@@ -1800,9 +1800,9 @@ impl SolutionDataset {
                 let ki = self.key_index(key_id)?;
                 let key = self.key(key_id)?;
 
-                let band_id = key.band_id; // dimension 2
-                let sample_id = key.sample_id; // dimension 3
-                let membership_id = key.membership_id; // dimension 4
+                let band_id = key.band_id;
+                let sample_id = key.sample_id;
+                let membership_id = key.membership_id;
 
                 let start_idx = ki.position;
                 let end_idx = ki.position + 8 * ki.length;
