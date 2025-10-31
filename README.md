@@ -74,13 +74,13 @@ and [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) i
 
    Make sure `~/local/bin/` is in your PATH.
 
-## Usage
-
 You can verify installation is successful by checking the version:
 
 ```shell
 plexos2duckdb --version
 ```
+
+## Quickstart
 
 You can run the help command to see available options:
 
@@ -88,8 +88,12 @@ You can run the help command to see available options:
 plexos2duckdb --help
 ```
 
-For usage:
+For converting a solution zip file to a duckdb database:
 
 ```shell
 plexos2duckdb --input "Model-DayAhead-Solution.zip" --output "Model-DayAhead-Solution.duckdb"
 ```
+
+Then, you can use any [duckdb compatible database viewer](https://duckdb.org/docs/stable/core_extensions/ui) to interactively explore the data with SQL:
+
+<img width="1728" height="775" alt="image" src="https://github.com/user-attachments/assets/ad829556-bef1-4982-b7b3-f7a62d225985" />
