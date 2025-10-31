@@ -14,8 +14,8 @@ This is a command line tool to convert PLEXOS solution files to a DuckDB databas
 Prebuilt binaries are available from the
 [GitHub Releases](https://github.com/epri-dev/plexos2duckdb/releases) page.
 
-1. Visit the [Releases](https://github.com/epri-dev/plexos2duckdb/releases) page.
-2. Download the appropriate binary for your operating system
+1. Go to the [latest release](https://github.com/epri-dev/plexos2duckdb/releases/latest) page on GitHub.
+2. Download the appropriate binary for your operating system.
 3. Extract the archive:
 
    ```shell
@@ -28,7 +28,7 @@ Prebuilt binaries are available from the
    Expand-Archive plexos2duckdb-<platform>.zip -DestinationPath .
    ```
 
-4. Copy the binary to a directory in your PATH:
+4. Copy the binary to a directory in your `PATH`, e.g.:
 
    ```shell
    # MacOS/Linux
@@ -37,7 +37,7 @@ Prebuilt binaries are available from the
    copy plexos2duckdb.exe %USERPROFILE%\local\bin\
    ```
 
-   Make sure `~/local/bin/` is in your PATH.
+   You will have to make sure `~/local/bin/` is in your `PATH`.
 
 ### Option 2: Build from Source
 
@@ -63,7 +63,7 @@ and [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) i
    target/release/plexos2duckdb
    ```
 
-3. Copy the binary to a directory in your PATH:
+3. Copy the binary to a directory in your `PATH`:
 
    ```shell
    # MacOS/Linux
@@ -72,28 +72,28 @@ and [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) i
    copy target\release\plexos2duckdb.exe %USERPROFILE%\local\bin\
    ```
 
-   Make sure `~/local/bin/` is in your PATH.
+   You will have to make sure `~/local/bin/` is in your `PATH`.
 
-You can verify installation is successful by checking the version:
+## Quickstart
+
+Verify installation is successful by checking the version:
 
 ```shell
 plexos2duckdb --version
 ```
 
-## Quickstart
-
-You can run the help command to see available options:
+Run the help command to see available options:
 
 ```shell
 plexos2duckdb --help
 ```
 
-For converting a solution zip file to a duckdb database:
+Convert a solution zip file to a duckdb database:
 
 ```shell
 plexos2duckdb --input "Model-DayAhead-Solution.zip" --output "Model-DayAhead-Solution.duckdb"
 ```
 
-Then, you can use any [duckdb compatible database viewer](https://duckdb.org/docs/stable/core_extensions/ui) to interactively explore the data with SQL:
+Use any [duckdb compatible database viewer](https://duckdb.org/docs/stable/core_extensions/ui) to interactively explore the data with SQL:
 
 <img width="1728" height="775" alt="image" src="https://github.com/user-attachments/assets/ad829556-bef1-4982-b7b3-f7a62d225985" />
