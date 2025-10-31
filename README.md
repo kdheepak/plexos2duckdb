@@ -91,11 +91,5 @@ plexos2duckdb --help
 For usage:
 
 ```shell
-plexos2duckdb --input <input_file> --output <output_file>
-```
-
-For SQA testing
-
-```shell
 plexos2duckdb --input "Model-DayAhead-Solution.zip" --output "Model-DayAhead-Solution.duckdb"
 ```
