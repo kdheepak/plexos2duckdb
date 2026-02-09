@@ -362,7 +362,25 @@ pub struct SolutionDataset {
     table_units_mapping: std::collections::HashMap<String, (String, i64)>,
 }
 
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    DataTableStart { index: usize, total: usize, table_name: String, keys: usize },
+    DataTableEnd,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DbWriteMode {
+    InMemoryThenCopy,
+    Direct,
+}
+
 impl SolutionDataset {
+    fn report_progress(progress: &mut Option<&mut dyn FnMut(&str)>, msg: &str) {
+        if let Some(report) = progress.as_mut() {
+            report(msg);
+        }
+    }
+
     /// Get a unit by its ID
     fn get_unit(&self, id: i64) -> Option<&Unit> {
         self.unit.get(&id)
@@ -423,6 +441,23 @@ impl SolutionDataset {
     }
 
     pub fn with_zip_file<P: AsRef<std::path::Path>>(self, path: P) -> Result<Self> {
+        self.with_zip_file_impl(path, None)
+    }
+
+    pub fn with_zip_file_with_progress<P: AsRef<std::path::Path>>(
+        self,
+        path: P,
+        report: &mut dyn FnMut(&str),
+    ) -> Result<Self> {
+        self.with_zip_file_impl(path, Some(report))
+    }
+
+    fn with_zip_file_impl<P: AsRef<std::path::Path>>(
+        self,
+        path: P,
+        mut report: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<Self> {
+        Self::report_progress(&mut report, "Opening ZIP archive");
         let file = std::fs::File::open(&path)?;
 
         // Get the zip file's stem (base name without extension)
@@ -432,6 +467,7 @@ impl SolutionDataset {
         let mut archive = zip::ZipArchive::new(file)?;
 
         // Find the preferred XML file in the archive
+        Self::report_progress(&mut report, "Selecting XML inside ZIP archive");
         let mut xml_content = String::new();
         let mut preferred_xml_index = None;
         let mut model_name_xml_index = None;
@@ -487,11 +523,13 @@ impl SolutionDataset {
             return Err(eyre!("No XML file found in the zip archive"));
         };
 
+        Self::report_progress(&mut report, "Reading XML from ZIP archive");
         let mut file = archive.by_index(xml_index_to_use)?;
         file.read_to_string(&mut xml_content)?;
         drop(file);
 
         // Prepare a temporary directory to extract BIN files
+        Self::report_progress(&mut report, "Extracting BIN files");
         let temp_dir = tempfile::TempDir::new()?;
         let mut period_data = indexmap::IndexMap::new();
 
@@ -519,55 +557,114 @@ impl SolutionDataset {
             }
         }
 
-        Ok(self.with_file(path).with_xml_string(&xml_content)?.with_period_data(period_data))
+        Self::report_progress(&mut report, "Parsing XML");
+        Ok(self.with_file(path).with_xml_string_impl(&xml_content, report)?.with_period_data(period_data))
     }
 
     pub fn with_xml_file<P: AsRef<std::path::Path>>(self, path: P) -> Result<Self> {
+        self.with_xml_file_impl(path, None)
+    }
+
+    pub fn with_xml_file_with_progress<P: AsRef<std::path::Path>>(
+        self,
+        path: P,
+        report: &mut dyn FnMut(&str),
+    ) -> Result<Self> {
+        self.with_xml_file_impl(path, Some(report))
+    }
+
+    fn with_xml_file_impl<P: AsRef<std::path::Path>>(
+        self,
+        path: P,
+        mut report: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<Self> {
+        Self::report_progress(&mut report, "Reading XML file");
         let mut file = std::fs::File::open(path)?;
         let mut content = String::new();
         file.read_to_string(&mut content)?;
-        self.with_xml_string(&content)
+        Self::report_progress(&mut report, "Parsing XML");
+        self.with_xml_string_impl(&content, report)
     }
 
-    pub fn with_xml_string(mut self, xml: &str) -> Result<Self> {
+    pub fn with_xml_string(self, xml: &str) -> Result<Self> {
+        self.with_xml_string_impl(xml, None)
+    }
+
+    fn with_xml_string_impl(mut self, xml: &str, mut report: Option<&mut dyn FnMut(&str)>) -> Result<Self> {
+        Self::report_progress(&mut report, "Parsing XML document");
         let doc = Document::parse(xml)?;
 
         let root = doc.root_element();
+        Self::report_progress(&mut report, "Parsing attribute data");
         self.parse_attribute_data(&root)?;
+        Self::report_progress(&mut report, "Parsing attributes");
         self.parse_attribute(&root)?;
+        Self::report_progress(&mut report, "Parsing properties");
         self.parse_property(&root)?;
+        Self::report_progress(&mut report, "Parsing bands");
         self.parse_band(&root)?;
+        Self::report_progress(&mut report, "Parsing categories");
         self.parse_category(&root)?;
+        Self::report_progress(&mut report, "Parsing class groups");
         self.parse_class_group(&root)?;
+        Self::report_progress(&mut report, "Parsing classes");
         self.parse_classes(&root)?;
+        Self::report_progress(&mut report, "Parsing collections");
         self.parse_collection(&root)?;
+        Self::report_progress(&mut report, "Parsing config");
         self.parse_config(&root)?;
+        Self::report_progress(&mut report, "Parsing key indexes");
         self.parse_key_index(&root)?;
+        Self::report_progress(&mut report, "Parsing keys");
         self.parse_key(&root)?;
+        Self::report_progress(&mut report, "Parsing memberships");
         self.parse_membership(&root)?;
+        Self::report_progress(&mut report, "Parsing models");
         self.parse_models(&root)?;
+        Self::report_progress(&mut report, "Parsing objects");
         self.parse_object(&root)?;
+        Self::report_progress(&mut report, "Parsing period intervals");
         self.parse_period0(&root)?;
+        Self::report_progress(&mut report, "Parsing period days");
         self.parse_period1(&root)?;
+        Self::report_progress(&mut report, "Parsing period weeks");
         self.parse_period2(&root)?;
+        Self::report_progress(&mut report, "Parsing period months");
         self.parse_period3(&root)?;
+        Self::report_progress(&mut report, "Parsing period years");
         self.parse_period4(&root)?;
+        Self::report_progress(&mut report, "Parsing period hours");
         self.parse_period6(&root)?;
+        Self::report_progress(&mut report, "Parsing period quarters");
         self.parse_period7(&root)?;
+        Self::report_progress(&mut report, "Parsing phase LT");
         self.parse_phase1(&root)?;
+        Self::report_progress(&mut report, "Parsing phase PASA");
         self.parse_phase2(&root)?;
+        Self::report_progress(&mut report, "Parsing phase MT");
         self.parse_phase3(&root)?;
+        Self::report_progress(&mut report, "Parsing phase ST");
         self.parse_phase4(&root)?;
+        Self::report_progress(&mut report, "Parsing samples");
         self.parse_sample(&root)?;
+        Self::report_progress(&mut report, "Parsing sample weights");
         self.parse_sample_weight(&root)?;
+        Self::report_progress(&mut report, "Parsing timeslices");
         self.parse_timeslice(&root)?;
+        Self::report_progress(&mut report, "Parsing units");
         self.parse_unit(&root)?;
+        Self::report_progress(&mut report, "Parsing memo objects");
         self.parse_memo_object(&root)?;
+        Self::report_progress(&mut report, "Parsing custom columns");
         self.parse_custom_column(&root)?;
 
+        Self::report_progress(&mut report, "Updating property band ids");
         self.update_property_band_id()?;
+        Self::report_progress(&mut report, "Building timestamp blocks");
         self.update_timestamp_block()?;
+        Self::report_progress(&mut report, "Updating collection membership counts");
         self.update_collection_membership_count()?;
+        Self::report_progress(&mut report, "Indexing table key mappings");
         self.update_table_key_indexes_mapping()?;
 
         Ok(self)
@@ -1169,50 +1266,222 @@ impl SolutionDataset {
     }
 
     pub fn to_duckdb<P: AsRef<std::path::Path>>(&self, db_path: P) -> Result<()> {
-        let db_path = db_path.as_ref();
-        let mut con = duckdb::Connection::open_in_memory()?;
+        self.to_duckdb_impl(db_path, None, None, DbWriteMode::InMemoryThenCopy)
+    }
 
+    pub fn to_duckdb_with_progress<P: AsRef<std::path::Path>>(
+        &self,
+        db_path: P,
+        report: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        self.to_duckdb_impl(db_path, Some(report), None, DbWriteMode::InMemoryThenCopy)
+    }
+
+    pub fn to_duckdb_with_progress_events<P: AsRef<std::path::Path>>(
+        &self,
+        db_path: P,
+        report: &mut dyn FnMut(&str),
+        progress: &mut dyn FnMut(ProgressEvent),
+    ) -> Result<()> {
+        self.to_duckdb_impl(db_path, Some(report), Some(progress), DbWriteMode::InMemoryThenCopy)
+    }
+
+    pub fn to_duckdb_with_progress_events_mode<P: AsRef<std::path::Path>>(
+        &self,
+        db_path: P,
+        report: &mut dyn FnMut(&str),
+        progress: &mut dyn FnMut(ProgressEvent),
+        mode: DbWriteMode,
+    ) -> Result<()> {
+        self.to_duckdb_impl(db_path, Some(report), Some(progress), mode)
+    }
+
+    pub fn to_duckdb_mode<P: AsRef<std::path::Path>>(&self, db_path: P, mode: DbWriteMode) -> Result<()> {
+        self.to_duckdb_impl(db_path, None, None, mode)
+    }
+
+    fn to_duckdb_impl<P: AsRef<std::path::Path>>(
+        &self,
+        db_path: P,
+        mut report: Option<&mut dyn FnMut(&str)>,
+        mut progress: Option<&mut dyn FnMut(ProgressEvent)>,
+        mode: DbWriteMode,
+    ) -> Result<()> {
+        let db_path = db_path.as_ref();
+        Self::report_progress(&mut report, "Initializing DuckDB");
+        let mut con = match mode {
+            DbWriteMode::InMemoryThenCopy => duckdb::Connection::open_in_memory()?,
+            DbWriteMode::Direct => duckdb::Connection::open(db_path)?,
+        };
+
+        Self::report_progress(&mut report, "Configuring DuckDB session");
         con.execute_batch("SET preserve_insertion_order = false;")?;
 
+        Self::report_progress(&mut report, "Creating raw schema");
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS raw;")?;
 
+        Self::report_progress(&mut report, "Writing metadata");
         self.populate_table_metadata(&mut con)?;
 
+        Self::report_progress(&mut report, "Writing config");
         self.populate_table_config(&mut con)?;
+        Self::report_progress(&mut report, "Writing memberships");
         self.populate_table_memberships(&mut con)?;
+        Self::report_progress(&mut report, "Writing collections");
         self.populate_table_collections(&mut con)?;
+        Self::report_progress(&mut report, "Writing classes");
         self.populate_table_classes(&mut con)?;
+        Self::report_progress(&mut report, "Writing class groups");
         self.populate_table_class_groups(&mut con)?;
+        Self::report_progress(&mut report, "Writing categories");
         self.populate_table_categories(&mut con)?;
+        Self::report_progress(&mut report, "Writing bands");
         self.populate_table_bands(&mut con)?;
+        Self::report_progress(&mut report, "Writing models");
         self.populate_table_models(&mut con)?;
+        Self::report_progress(&mut report, "Writing objects");
         self.populate_table_objects(&mut con)?;
+        Self::report_progress(&mut report, "Writing keys");
         self.populate_table_keys(&mut con)?;
+        Self::report_progress(&mut report, "Writing key indexes");
         self.populate_table_key_indexes(&mut con)?;
+        Self::report_progress(&mut report, "Writing properties");
         self.populate_table_properties(&mut con)?;
+        Self::report_progress(&mut report, "Writing timeslices");
         self.populate_table_timeslices(&mut con)?;
+        Self::report_progress(&mut report, "Writing samples");
         self.populate_table_samples(&mut con)?;
+        Self::report_progress(&mut report, "Writing units");
         self.populate_table_units(&mut con)?;
+        Self::report_progress(&mut report, "Writing memo objects");
         self.populate_table_memo_objects(&mut con)?;
+        Self::report_progress(&mut report, "Writing custom columns");
         self.populate_table_custom_columns(&mut con)?;
+        Self::report_progress(&mut report, "Writing attribute data");
         self.populate_table_attribute_data(&mut con)?;
+        Self::report_progress(&mut report, "Writing attributes");
         self.populate_table_attributes(&mut con)?;
+        Self::report_progress(&mut report, "Writing timestamp blocks");
         self.populate_table_timestamps_block(&mut con)?;
 
-        self.populate_table_data(&mut con)?;
+        Self::report_progress(&mut report, "Writing time series data");
+        self.populate_table_data(&mut con, &mut progress)?;
 
+        Self::report_progress(&mut report, "Creating processed views");
         self.create_processed_views(&mut con)?;
 
+        Self::report_progress(&mut report, "Creating report views");
         self.create_report_views(&mut con)?;
 
-        con.execute_batch(&format!(
-            "
-              ATTACH '{}' as my_database;
-              COPY FROM DATABASE memory TO my_database;
-              DETACH my_database;
-            ",
-            db_path.to_str().unwrap_or_default()
-        ))?;
+        Self::report_progress(&mut report, "Persisting DuckDB database");
+        if let DbWriteMode::InMemoryThenCopy = mode {
+            con.execute_batch(&format!(
+                "
+                  ATTACH '{}' as my_database;
+                  COPY FROM DATABASE memory TO my_database;
+                  DETACH my_database;
+                ",
+                db_path.to_str().unwrap_or_default()
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    fn populate_table_data(
+        &self,
+        con: &mut duckdb::Connection,
+        progress: &mut Option<&mut dyn FnMut(ProgressEvent)>,
+    ) -> Result<()> {
+        con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
+
+        let total_tables = self.table_key_index_mapping.len();
+        for (table_idx, (table_name, key_ids)) in self.table_key_index_mapping.clone().into_iter().enumerate() {
+            if let Some(report) = progress.as_mut() {
+                report(ProgressEvent::DataTableStart {
+                    index: table_idx + 1,
+                    total: total_tables,
+                    table_name: table_name.clone(),
+                    keys: key_ids.len(),
+                });
+            }
+
+            con.execute_batch(&format!(
+                "
+                CREATE TABLE data.\"{table_name}\" (
+                  key_id BIGINT,
+                  sample_id BIGINT,
+                  band_id BIGINT,
+                  membership_id BIGINT,
+                  block_id BIGINT,
+                  value DOUBLE,
+                )
+              ",
+            ))?;
+
+            // TODO: check whether period_offset is the starting period of the timeseries data
+
+            let mut appender = con.appender_to_db(&table_name, "data")?;
+
+            for key_id in key_ids.into_iter() {
+                let ki = self.key_index(key_id)?;
+                let key = self.key(key_id)?;
+
+                let band_id = key.band_id;
+                let sample_id = key.sample_id;
+                let membership_id = key.membership_id;
+
+                let byte_len =
+                    ki.length.checked_mul(8).ok_or_else(|| eyre!("Key index length overflow for key_id {}", key_id))?;
+                let end_idx = ki
+                    .position
+                    .checked_add(byte_len)
+                    .ok_or_else(|| eyre!("Key index position overflow for key_id {}", key_id))?;
+                let raw_data =
+                    self.period_data.get(&ki.period_type_id).ok_or_else(|| eyre!("period type not found"))?;
+                let start_idx = usize::try_from(ki.position).map_err(|_| {
+                    eyre!(
+                        "Key index position exceeds addressable memory for key_id {}. On 32-bit builds, files >4GB are not supported.",
+                        key_id
+                    )
+                })?;
+                let end_idx = usize::try_from(end_idx).map_err(|_| {
+                    eyre!(
+                        "Key index end exceeds addressable memory for key_id {}. On 32-bit builds, files >4GB are not supported.",
+                        key_id
+                    )
+                })?;
+                if end_idx > raw_data.len() {
+                    return Err(eyre!(
+                        "Key index slice out of bounds for key_id {} (end {}, len {})",
+                        key_id,
+                        end_idx,
+                        raw_data.len()
+                    ));
+                }
+                let raw_data = &raw_data[start_idx..end_idx];
+                let data = raw_data.chunks_exact(8).map(TryInto::try_into).map(Result::unwrap).map(f64::from_le_bytes);
+                let period_offset = usize::try_from(ki.period_offset)
+                    .map_err(|_| eyre!("Invalid period_offset for key_id {}", key_id))?;
+
+                // dimension 1 is the enumerated time
+                for (block_id, value) in data.enumerate() {
+                    appender.append_row(duckdb::params![
+                        key_id,
+                        sample_id,
+                        band_id,
+                        membership_id,
+                        block_id + period_offset + 1,
+                        value
+                    ])?;
+                }
+            }
+            appender.flush()?;
+
+            if let Some(report) = progress.as_mut() {
+                report(ProgressEvent::DataTableEnd);
+            }
+        }
 
         Ok(())
     }
@@ -1770,88 +2039,6 @@ impl SolutionDataset {
             let mut appender = con.appender_to_db(&format!("timestamp_block_{name}"), "raw")?;
             for (value, interval_id) in values.iter() {
                 appender.append_row(duckdb::params![interval_id, value])?;
-            }
-            appender.flush()?;
-        }
-
-        Ok(())
-    }
-
-    fn populate_table_data(&self, con: &mut duckdb::Connection) -> Result<()> {
-        con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
-
-        for (table_name, key_ids) in self.table_key_index_mapping.clone() {
-            con.execute_batch(&format!(
-                "
-                CREATE TABLE data.\"{table_name}\" (
-                  key_id BIGINT,
-                  sample_id BIGINT,
-                  band_id BIGINT,
-                  membership_id BIGINT,
-                  block_id BIGINT,
-                  value DOUBLE,
-                )
-              ",
-            ))?;
-
-            // TODO: check whether period_offset is the starting period of the timeseries data
-
-            let mut appender = con.appender_to_db(&table_name, "data")?;
-
-            for key_id in key_ids {
-                let ki = self.key_index(key_id)?;
-                let key = self.key(key_id)?;
-
-                let band_id = key.band_id;
-                let sample_id = key.sample_id;
-                let membership_id = key.membership_id;
-
-                let byte_len = ki
-                    .length
-                    .checked_mul(8)
-                    .ok_or_else(|| eyre!("Key index length overflow for key_id {}", key_id))?;
-                let end_idx = ki
-                    .position
-                    .checked_add(byte_len)
-                    .ok_or_else(|| eyre!("Key index position overflow for key_id {}", key_id))?;
-                let raw_data =
-                    self.period_data.get(&ki.period_type_id).ok_or_else(|| eyre!("period type not found"))?;
-                let start_idx = usize::try_from(ki.position).map_err(|_| {
-                    eyre!(
-                        "Key index position exceeds addressable memory for key_id {}. On 32-bit builds, files >4GB are not supported.",
-                        key_id
-                    )
-                })?;
-                let end_idx = usize::try_from(end_idx).map_err(|_| {
-                    eyre!(
-                        "Key index end exceeds addressable memory for key_id {}. On 32-bit builds, files >4GB are not supported.",
-                        key_id
-                    )
-                })?;
-                if end_idx > raw_data.len() {
-                    return Err(eyre!(
-                        "Key index slice out of bounds for key_id {} (end {}, len {})",
-                        key_id,
-                        end_idx,
-                        raw_data.len()
-                    ));
-                }
-                let raw_data = &raw_data[start_idx..end_idx];
-                let data = raw_data.chunks_exact(8).map(TryInto::try_into).map(Result::unwrap).map(f64::from_le_bytes);
-                let period_offset =
-                    usize::try_from(ki.period_offset).map_err(|_| eyre!("Invalid period_offset for key_id {}", key_id))?;
-
-                // dimension 1 is the enumerated time
-                for (block_id, value) in data.enumerate() {
-                    appender.append_row(duckdb::params![
-                        key_id,
-                        sample_id,
-                        band_id,
-                        membership_id,
-                        block_id + period_offset + 1,
-                        value
-                    ])?;
-                }
             }
             appender.flush()?;
         }

@@ -1,8 +1,14 @@
+use std::time::{Duration, Instant};
+
 use clap::Parser;
 use color_eyre::{
     Result,
     eyre::{ContextCompat, eyre},
 };
+use console::Term;
+use ctrlc;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use owo_colors::OwoColorize;
 use plexos2duckdb;
 
 #[derive(Parser)]
@@ -17,6 +23,12 @@ struct Args {
     /// Print a summary of the dataset
     #[arg(long, default_value_t = false)]
     print_summary: bool,
+    /// Disable progress bar output
+    #[arg(long, default_value_t = false)]
+    no_progress_bar: bool,
+    /// Stage in memory then copy to disk (faster, but uses more RAM)
+    #[arg(long, default_value_t = false)]
+    in_memory: bool,
 }
 
 fn resolve_input_path(input: &std::path::Path) -> Result<std::path::PathBuf> {
@@ -65,6 +77,99 @@ fn run(args: Args) -> Result<()> {
     let input_dir = input_path.parent().ok_or_else(|| eyre!("Input path has no parent directory"))?;
     let output_path = resolve_output_path(&input_path, args.output)?;
 
+    let mut mp = None;
+    let mut pb = None;
+    let mut data_tables_pb = None;
+    let mut current_table = None;
+    let mut last_msg = String::new();
+    let mut start_time = None;
+    let mut last_mark = None;
+    let mut total_line = None;
+    let mut term = None;
+    if !args.no_progress_bar {
+        let term_handle = Term::stderr();
+        let _ = term_handle.hide_cursor();
+        let multi = MultiProgress::new();
+        multi.set_draw_target(ProgressDrawTarget::term(term_handle.clone(), 120));
+        let spinner = multi.add(ProgressBar::new_spinner());
+        spinner.set_style(ProgressStyle::with_template("{spinner:.green} {elapsed_precise:.dim} {msg}").unwrap());
+        spinner.enable_steady_tick(Duration::from_millis(120));
+        start_time = Some(Instant::now());
+        last_mark = start_time;
+        pb = Some(spinner);
+        mp = Some(multi);
+        term = Some(term_handle);
+    }
+    if let Some(term) = term.clone() {
+        let _ = ctrlc::set_handler(move || {
+            let _ = term.show_cursor();
+            eprintln!();
+            std::process::exit(130);
+        });
+    }
+    struct CursorGuard(Option<Term>);
+    impl Drop for CursorGuard {
+        fn drop(&mut self) {
+            if let Some(term) = self.0.as_ref() {
+                let _ = term.show_cursor();
+            }
+        }
+    }
+    let _cursor_guard = CursorGuard(term.clone());
+    let mut report = |msg: &str| {
+        if let Some(spinner) = pb.as_ref() {
+            if msg != last_msg {
+                let now = Instant::now();
+                if !last_msg.is_empty() {
+                    let delta = last_mark.map(|s| now.duration_since(s)).unwrap_or_default();
+                    let line = format!("[+{:>6.2}s]", delta.as_secs_f64()).dimmed().to_string();
+                    let msg = last_msg.cyan().to_string();
+                    spinner.println(format!("{line} {msg}"));
+                }
+                spinner.set_message(msg.to_string());
+                last_msg.clear();
+                last_msg.push_str(msg);
+                last_mark = Some(now);
+                if let Some(start) = start_time {
+                    let total = now.duration_since(start);
+                    total_line = Some(format!("Total time: {:.2}s", total.as_secs_f64()));
+                }
+            }
+        }
+    };
+
+    let mut report_data = |event: plexos2duckdb::ProgressEvent| {
+        if args.no_progress_bar {
+            return;
+        }
+        match event {
+            plexos2duckdb::ProgressEvent::DataTableStart { index, total, table_name, keys: _ } => {
+                current_table = Some(table_name);
+                if data_tables_pb.is_none() {
+                    if let Some(multi) = mp.as_ref() {
+                        let bar = multi.add(ProgressBar::new(total as u64));
+                        bar.set_style(
+                            ProgressStyle::with_template(
+                                "{bar:40.cyan/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.cyan}",
+                            )
+                            .unwrap(),
+                        );
+                        data_tables_pb = Some(bar);
+                    }
+                }
+                if let Some(bar) = data_tables_pb.as_ref() {
+                    bar.set_length(total as u64);
+                    bar.set_position(index as u64);
+                    let table = current_table.as_deref().unwrap_or("data");
+                    bar.set_message(format!("{table}"));
+                }
+            },
+            plexos2duckdb::ProgressEvent::DataTableEnd => {
+                current_table = None;
+            },
+        }
+    };
+
     // Extract model name from the file name
     let file_name =
         input_path.file_name().context("File name must exist")?.to_str().context("File name must be valid UTF-8")?;
@@ -94,13 +199,14 @@ fn run(args: Args) -> Result<()> {
         if actual_input_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("zip")) {
             let mut ds = plexos2duckdb::SolutionDataset::default()
                 .with_model_name(model_name.to_string())
-                .with_zip_file(&actual_input_path)?;
+                .with_zip_file_with_progress(&actual_input_path, &mut report)?;
             // Look for a log file with the correct model name pattern
             let log_path = actual_input_path
                 .parent()
                 .ok_or_else(|| eyre!("Could not determine parent directory for input file"))?
                 .join(format!("Model ( {} ) Log.txt", model_name));
             if log_path.exists() {
+                report("Reading simulation log");
                 let log = std::fs::read_to_string(&log_path)?;
                 ds = ds.with_simulation_log(log);
             }
@@ -108,9 +214,10 @@ fn run(args: Args) -> Result<()> {
         } else if actual_input_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("xml")) {
             let mut ds = plexos2duckdb::SolutionDataset::default()
                 .with_model_name(model_name.to_string())
-                .with_xml_file(&actual_input_path)?;
+                .with_xml_file_with_progress(&actual_input_path, &mut report)?;
             let log_path = input_dir.join(format!("Model ( {} ) Log.txt", model_name));
             if log_path.exists() {
+                report("Reading simulation log");
                 let log = std::fs::read_to_string(&log_path)?;
                 ds = ds.with_simulation_log(log);
             }
@@ -122,17 +229,63 @@ fn run(args: Args) -> Result<()> {
 
     let run_stats = input_dir.join(std::path::Path::new("runstats.json"));
     let dataset = if let Ok(run_stats) = std::fs::read_to_string(&run_stats) {
+        report("Reading run stats");
         dataset.with_run_stats(run_stats)
     } else {
         dataset
     };
 
     if args.print_summary {
+        if let Some(spinner) = pb.as_ref() {
+            if !last_msg.is_empty() {
+                let now = Instant::now();
+                let delta = last_mark.map(|s| now.duration_since(s)).unwrap_or_default();
+                let line = format!("[+{:>6.2}s]", delta.as_secs_f64()).dimmed().to_string();
+                let msg = last_msg.cyan().to_string();
+                spinner.println(format!("{line} {msg}"));
+            }
+            spinner.finish_and_clear();
+        }
+        if let Some(term) = term.as_ref() {
+            let _ = term.show_cursor();
+        }
+        if let Some(bar) = data_tables_pb.as_ref() {
+            bar.finish_and_clear();
+        }
+        if let Some(line) = total_line.as_ref() {
+            eprintln!("{}", line.green());
+        }
         dataset.print_summary();
         return Ok(());
     }
-    dataset.to_duckdb(&output_path)?;
-    println!("DuckDB database created at: {}", output_path.display());
+    report("Creating DuckDB database");
+    let mode =
+        if args.in_memory { plexos2duckdb::DbWriteMode::InMemoryThenCopy } else { plexos2duckdb::DbWriteMode::Direct };
+    if args.no_progress_bar {
+        dataset.to_duckdb_mode(&output_path, mode)?;
+    } else {
+        dataset.to_duckdb_with_progress_events_mode(&output_path, &mut report, &mut report_data, mode)?;
+    }
+    if let Some(spinner) = pb.as_ref() {
+        if !last_msg.is_empty() {
+            let now = Instant::now();
+            let delta = last_mark.map(|s| now.duration_since(s)).unwrap_or_default();
+            let line = format!("[+{:>6.2}s]", delta.as_secs_f64()).dimmed().to_string();
+            let msg = last_msg.cyan().to_string();
+            spinner.println(format!("{line} {msg}"));
+        }
+        spinner.finish_and_clear();
+    }
+    if let Some(term) = term.as_ref() {
+        let _ = term.show_cursor();
+    }
+    if let Some(bar) = data_tables_pb.as_ref() {
+        bar.finish_and_clear();
+    }
+    if let Some(line) = total_line.as_ref() {
+        eprintln!("{}", line.green());
+    }
+    println!("{} {}", "DuckDB database created at:".green(), output_path.display().to_string().blue());
     Ok(())
 }
 
