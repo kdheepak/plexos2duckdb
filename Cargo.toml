@@ -1,6 +1,6 @@
 [package]
 name = "plexos2duckdb"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.1"
 edition = "2024"
 build = "build.rs"
 description = "A tool to convert PLEXOS Solution files to a DuckDB database."
@@ -23,7 +23,7 @@ memmap2 = "0.9.9"
 regex = "1.11.1"
 roxmltree = "0.21.1"
 tempfile = "3.23.0"
-zip = "6.0.0"
+zip = "7.4.0"
 
 [profile.release]
 debug = "line-tables-only"
@@ -39,7 +39,7 @@ path = "src/main.rs"
 pretty_assertions = "1.4.1"
 
 [build-dependencies]
-vergen-gitcl = { version = "1.0.8", features = [
+vergen-gitcl = { version = "9.1.0", features = [
   "build",
   "cargo",
   "rustc",
