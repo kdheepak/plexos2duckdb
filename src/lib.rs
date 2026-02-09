@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![doc = include_str!("../README.md")]
 
-use std::io::Read as _;
+use std::io::{BufReader, Read as _, Seek, SeekFrom};
 
 use color_eyre::{Result, eyre::eyre};
 use roxmltree::{Document, Node};
@@ -353,7 +353,8 @@ pub struct SolutionDataset {
     unit: indexmap::IndexMap<i64, Unit>,
     memo_object: Vec<MemoObject>,
     custom_column: indexmap::IndexMap<i64, CustomColumn>,
-    period_data: indexmap::IndexMap<i64, memmap2::Mmap>,
+    period_data: indexmap::IndexMap<i64, std::fs::File>,
+    temp_dir: Option<tempfile::TempDir>,
     simulation_log: Option<String>,
     run_stats: Option<String>,
     // calculated fields
@@ -404,7 +405,7 @@ impl SolutionDataset {
         self
     }
 
-    pub fn with_period_data(mut self, period_data: indexmap::IndexMap<i64, memmap2::Mmap>) -> Self {
+    pub fn with_period_data(mut self, period_data: indexmap::IndexMap<i64, std::fs::File>) -> Self {
         self.period_data = period_data;
         self
     }
@@ -549,16 +550,16 @@ impl SolutionDataset {
                 // Ensure data is flushed to disk
                 drop(out_file);
 
-                // Memory-map the extracted file
-                let mmap_file = std::fs::File::open(&temp_file_path)?;
-                let mmap = unsafe { memmap2::Mmap::map(&mmap_file)? };
-
-                period_data.insert(digit, mmap);
+                // Open the extracted file for streaming reads
+                let file = std::fs::File::open(&temp_file_path)?;
+                period_data.insert(digit, file);
             }
         }
 
         Self::report_progress(&mut report, "Parsing XML");
-        Ok(self.with_file(path).with_xml_string_impl(&xml_content, report)?.with_period_data(period_data))
+        let mut ds = self.with_file(path).with_xml_string_impl(&xml_content, report)?.with_period_data(period_data);
+        ds.temp_dir = Some(temp_dir);
+        Ok(ds)
     }
 
     pub fn with_xml_file<P: AsRef<std::path::Path>>(self, path: P) -> Result<Self> {
@@ -1393,38 +1394,6 @@ impl SolutionDataset {
         con: &mut duckdb::Connection,
         progress: &mut Option<&mut dyn FnMut(ProgressEvent)>,
     ) -> Result<()> {
-        #[derive(Debug)]
-        enum BinSliceError {
-            Overflow,
-            OutOfBounds,
-            Misaligned,
-            NegativePeriodOffset,
-        }
-
-        type BinResult<T> = std::result::Result<T, BinSliceError>;
-
-        fn u64_to_usize(x: u64) -> BinResult<usize> {
-            usize::try_from(x).map_err(|_| BinSliceError::Overflow)
-        }
-
-        fn slice_bin_f64_bytes<'a>(mmap: &'a [u8], position_bytes: u64, length_values: u64) -> BinResult<&'a [u8]> {
-            if position_bytes % 8 != 0 {
-                return Err(BinSliceError::Misaligned);
-            }
-
-            let byte_len = length_values.checked_mul(8).ok_or(BinSliceError::Overflow)?;
-            let end_bytes = position_bytes.checked_add(byte_len).ok_or(BinSliceError::Overflow)?;
-
-            let start = u64_to_usize(position_bytes)?;
-            let end = u64_to_usize(end_bytes)?;
-
-            mmap.get(start..end).ok_or(BinSliceError::OutOfBounds)
-        }
-
-        fn period_offset_u64(x: i64) -> BinResult<u64> {
-            x.try_into().map_err(|_| BinSliceError::NegativePeriodOffset)
-        }
-
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
         let total_tables = self.table_key_index_mapping.len();
@@ -1457,37 +1426,34 @@ impl SolutionDataset {
                 let ki = self.key_index(key_id)?;
                 let key = self.key(key_id)?;
 
-                let mmap = self
+                let file = self
                     .period_data
                     .get(&ki.period_type_id)
                     .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
 
-                let raw_slice = slice_bin_f64_bytes(&mmap[..], ki.position, ki.length).map_err(|e| {
-                eyre!(
-                    "BIN slice error for key_id {} (period_type_id={}, pos_bytes={}, len_values={}, mmap_len_bytes={}): {:?}",
-                    key_id,
-                    ki.period_type_id,
-                    ki.position,
-                    ki.length,
-                    mmap.len(),
-                    e
-                )
-            })?;
+                if ki.position % 8 != 0 {
+                    return Err(eyre!(
+                        "BIN position misaligned for key_id {} (pos_bytes={})",
+                        key_id,
+                        ki.position
+                    ));
+                }
 
-                let period_offset = period_offset_u64(ki.period_offset).map_err(|e| {
-                    eyre!("period_offset error for key_id {} (period_offset={}): {:?}", key_id, ki.period_offset, e)
-                })?;
+                let mut reader = BufReader::new(file.try_clone()?);
+                reader.seek(SeekFrom::Start(ki.position))?;
 
-                for (i, chunk) in raw_slice.chunks_exact(8).enumerate() {
-                    let value = f64::from_le_bytes(chunk.try_into().unwrap());
+                let period_offset: i64 = ki.period_offset;
+                let mut buf = [0u8; 8];
+                let mut i: u64 = 0;
+                while i < ki.length {
+                    reader.read_exact(&mut buf)?;
+                    let value = f64::from_le_bytes(buf);
 
-                    let block_id_u64 = (i as u64)
+                    let block_id_i64 = i64::try_from(i)
+                        .map_err(|_| eyre!("block_id exceeds i64 for key_id {}", key_id))?
                         .checked_add(period_offset)
-                        .and_then(|x| x.checked_add(1))
+                        .and_then(|v| v.checked_add(1))
                         .ok_or_else(|| eyre!("block_id overflow for key_id {}", key_id))?;
-
-                    let block_id_i64: i64 =
-                        block_id_u64.try_into().map_err(|_| eyre!("block_id exceeds i64 for key_id {}", key_id))?;
 
                     appender.append_row(duckdb::params![
                         key_id,
@@ -1497,6 +1463,8 @@ impl SolutionDataset {
                         block_id_i64,
                         value
                     ])?;
+
+                    i += 1;
                 }
             }
 
