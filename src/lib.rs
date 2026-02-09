@@ -1244,20 +1244,20 @@ impl SolutionDataset {
             "
               CREATE TYPE object_kind AS ENUM ('object', 'relation');
               CREATE TABLE raw.memberships (
-                membership_id INTEGER PRIMARY KEY,
-                collection_id INTEGER,
+                membership_id BIGINT PRIMARY KEY,
+                collection_id BIGINT,
                 collection VARCHAR,
-                child_id INTEGER,
+                child_id BIGINT,
                 child_name VARCHAR,
                 child_category VARCHAR,
                 child_category_class VARCHAR,
-                parent_id INTEGER,
+                parent_id BIGINT,
                 parent_name VARCHAR,
                 parent_category VARCHAR,
                 parent_category_class VARCHAR,
-                child_class_id INTEGER,
+                child_class_id BIGINT,
                 child_class_name VARCHAR,
-                parent_class_id INTEGER,
+                parent_class_id BIGINT,
                 parent_class_name VARCHAR,
                 kind object_kind,
               );
@@ -1307,9 +1307,9 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.collections (
-                collection_id INTEGER PRIMARY KEY,
-                parent_class_id INTEGER,
-                child_class_id INTEGER,
+                collection_id BIGINT PRIMARY KEY,
+                parent_class_id BIGINT,
+                child_class_id BIGINT,
                 name VARCHAR,
                 complement_name VARCHAR
               );
@@ -1337,9 +1337,9 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.classes (
-                class_id INTEGER PRIMARY KEY,
+                class_id BIGINT PRIMARY KEY,
                 name VARCHAR,
-                class_group_id INTEGER
+                class_group_id BIGINT
               );
               ",
         )?;
@@ -1359,7 +1359,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.class_groups (
-                class_group_id INTEGER PRIMARY KEY,
+                class_group_id BIGINT PRIMARY KEY,
                 name VARCHAR
               );
               ",
@@ -1380,9 +1380,9 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.categories (
-                category_id INTEGER PRIMARY KEY,
-                class_id INTEGER,
-                rank INTEGER,
+                category_id BIGINT PRIMARY KEY,
+                class_id BIGINT,
+                rank BIGINT,
                 name VARCHAR
               );
               ",
@@ -1408,7 +1408,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.bands (
-                band_id INTEGER PRIMARY KEY,
+                band_id BIGINT PRIMARY KEY,
               );
               ",
         )?;
@@ -1428,7 +1428,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.models (
-                model_id INTEGER PRIMARY KEY,
+                model_id BIGINT PRIMARY KEY,
                 name VARCHAR
               );
               ",
@@ -1449,11 +1449,11 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.objects (
-                object_id INTEGER PRIMARY KEY,
-                class_id INTEGER,
+                object_id BIGINT PRIMARY KEY,
+                class_id BIGINT,
                 name VARCHAR,
-                category_id INTEGER,
-                index INTEGER,
+                category_id BIGINT,
+                index BIGINT,
                 is_show BOOLEAN,
               );
               ",
@@ -1482,14 +1482,14 @@ impl SolutionDataset {
             "
               CREATE TABLE raw.keys (
                 key_id BIGINT PRIMARY KEY,
-                membership_id INTEGER,
-                model_id INTEGER,
-                phase_id INTEGER,
-                property_id INTEGER,
+                membership_id BIGINT,
+                model_id BIGINT,
+                phase_id BIGINT,
+                property_id BIGINT,
                 is_summary BOOLEAN,
-                band_id INTEGER,
-                sample_id INTEGER,
-                timeslice_id INTEGER
+                band_id BIGINT,
+                sample_id BIGINT,
+                timeslice_id BIGINT
               );
               ",
         )?;
@@ -1549,16 +1549,16 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.properties (
-                property_id INTEGER PRIMARY KEY,
+                property_id BIGINT PRIMARY KEY,
                 name VARCHAR,
                 summary_name VARCHAR,
-                enum_id INTEGER,
-                unit_id INTEGER,
-                summary_unit_id INTEGER,
+                enum_id BIGINT,
+                unit_id BIGINT,
+                summary_unit_id BIGINT,
                 is_multi_band BOOLEAN,
                 is_period BOOLEAN,
                 is_summary BOOLEAN,
-                collection_id INTEGER,
+                collection_id BIGINT,
               );
               ",
         )?;
@@ -1586,7 +1586,7 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.timeslices (
-                timeslice_id INTEGER PRIMARY KEY,
+                timeslice_id BIGINT PRIMARY KEY,
                 timeslice_name VARCHAR,
               );
               ",
@@ -1604,9 +1604,9 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.samples (
-                sample_id INTEGER PRIMARY KEY,
+                sample_id BIGINT PRIMARY KEY,
                 sample_name VARCHAR,
-                sample_phase_id INTEGER,
+                sample_phase_id BIGINT,
                 sample_weight DOUBLE,
               );
               ",
@@ -1634,9 +1634,9 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.units (
-                unit_id INTEGER PRIMARY KEY,
+                unit_id BIGINT PRIMARY KEY,
                 unit_name VARCHAR,
-                lang_id INTEGER,
+                lang_id BIGINT,
               );
               ",
         )?;
@@ -1653,8 +1653,8 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.memo_objects (
-                object_id INTEGER,
-                column_id INTEGER,
+                object_id BIGINT,
+                column_id BIGINT,
                 value VARCHAR,
               );
               ",
@@ -1672,10 +1672,10 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.custom_columns (
-                column_id INTEGER PRIMARY KEY,
+                column_id BIGINT PRIMARY KEY,
                 name VARCHAR,
-                position INTEGER,
-                class_id INTEGER,
+                position BIGINT,
+                class_id BIGINT,
               );
               ",
         )?;
@@ -1692,8 +1692,8 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.attribute_data (
-                object_id INTEGER,
-                attribute_id INTEGER,
+                object_id BIGINT,
+                attribute_id BIGINT,
                 value VARCHAR,
               );
               ",
@@ -1713,10 +1713,10 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.attributes (
-                attribute_id INTEGER PRIMARY KEY,
+                attribute_id BIGINT PRIMARY KEY,
                 name VARCHAR,
-                lang_id INTEGER,
-                class_id INTEGER,
+                lang_id BIGINT,
+                class_id BIGINT,
                 description VARCHAR,
               );
               ",
@@ -1761,7 +1761,7 @@ impl SolutionDataset {
             con.execute_batch(&format!(
                 "
                   CREATE TABLE raw.timestamp_block_{name} (
-                    interval_id INTEGER,
+                    interval_id BIGINT,
                     datetime TIMESTAMP,
                   );
                 ",
@@ -1785,10 +1785,10 @@ impl SolutionDataset {
                 "
                 CREATE TABLE data.\"{table_name}\" (
                   key_id BIGINT,
-                  sample_id INTEGER,
-                  band_id INTEGER,
-                  membership_id INTEGER,
-                  block_id INTEGER,
+                  sample_id BIGINT,
+                  band_id BIGINT,
+                  membership_id BIGINT,
+                  block_id BIGINT,
                   value DOUBLE,
                 )
               ",
