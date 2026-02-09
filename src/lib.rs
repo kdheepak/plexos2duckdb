@@ -1317,6 +1317,9 @@ impl SolutionDataset {
 
         Self::report_progress(&mut report, "Configuring DuckDB session");
         con.execute_batch("SET preserve_insertion_order = false;")?;
+        if let DbWriteMode::Direct = mode {
+            con.execute_batch("PRAGMA enable_checkpoint_on_shutdown;")?;
+        }
 
         Self::report_progress(&mut report, "Creating raw schema");
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS raw;")?;
@@ -1384,6 +1387,8 @@ impl SolutionDataset {
                 ",
                 db_path.to_str().unwrap_or_default()
             ))?;
+        } else {
+            con.execute_batch("CHECKPOINT;")?;
         }
 
         Ok(())
