@@ -1393,6 +1393,38 @@ impl SolutionDataset {
         con: &mut duckdb::Connection,
         progress: &mut Option<&mut dyn FnMut(ProgressEvent)>,
     ) -> Result<()> {
+        #[derive(Debug)]
+        enum BinSliceError {
+            Overflow,
+            OutOfBounds,
+            Misaligned,
+            NegativePeriodOffset,
+        }
+
+        type BinResult<T> = std::result::Result<T, BinSliceError>;
+
+        fn u64_to_usize(x: u64) -> BinResult<usize> {
+            usize::try_from(x).map_err(|_| BinSliceError::Overflow)
+        }
+
+        fn slice_bin_f64_bytes<'a>(mmap: &'a [u8], position_bytes: u64, length_values: u64) -> BinResult<&'a [u8]> {
+            if position_bytes % 8 != 0 {
+                return Err(BinSliceError::Misaligned);
+            }
+
+            let byte_len = length_values.checked_mul(8).ok_or(BinSliceError::Overflow)?;
+            let end_bytes = position_bytes.checked_add(byte_len).ok_or(BinSliceError::Overflow)?;
+
+            let start = u64_to_usize(position_bytes)?;
+            let end = u64_to_usize(end_bytes)?;
+
+            mmap.get(start..end).ok_or(BinSliceError::OutOfBounds)
+        }
+
+        fn period_offset_u64(x: i64) -> BinResult<u64> {
+            x.try_into().map_err(|_| BinSliceError::NegativePeriodOffset)
+        }
+
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
         let total_tables = self.table_key_index_mapping.len();
@@ -1407,19 +1439,17 @@ impl SolutionDataset {
             }
 
             con.execute_batch(&format!(
-                "
-                CREATE TABLE data.\"{table_name}\" (
+                r#"
+                CREATE TABLE data."{table_name}" (
                   key_id BIGINT,
                   sample_id BIGINT,
                   band_id BIGINT,
                   membership_id BIGINT,
                   block_id BIGINT,
-                  value DOUBLE,
+                  value DOUBLE
                 )
-              ",
+            "#
             ))?;
-
-            // TODO: check whether period_offset is the starting period of the timeseries data
 
             let mut appender = con.appender_to_db(&table_name, "data")?;
 
@@ -1427,55 +1457,49 @@ impl SolutionDataset {
                 let ki = self.key_index(key_id)?;
                 let key = self.key(key_id)?;
 
-                let band_id = key.band_id;
-                let sample_id = key.sample_id;
-                let membership_id = key.membership_id;
+                let mmap = self
+                    .period_data
+                    .get(&ki.period_type_id)
+                    .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
 
-                let byte_len =
-                    ki.length.checked_mul(8).ok_or_else(|| eyre!("Key index length overflow for key_id {}", key_id))?;
-                let end_idx = ki
-                    .position
-                    .checked_add(byte_len)
-                    .ok_or_else(|| eyre!("Key index position overflow for key_id {}", key_id))?;
-                let raw_data =
-                    self.period_data.get(&ki.period_type_id).ok_or_else(|| eyre!("period type not found"))?;
-                let start_idx = usize::try_from(ki.position).map_err(|_| {
-                    eyre!(
-                        "Key index position exceeds addressable memory for key_id {}. On 32-bit builds, files >4GB are not supported.",
-                        key_id
-                    )
-                })?;
-                let end_idx = usize::try_from(end_idx).map_err(|_| {
-                    eyre!(
-                        "Key index end exceeds addressable memory for key_id {}. On 32-bit builds, files >4GB are not supported.",
-                        key_id
-                    )
-                })?;
-                if end_idx > raw_data.len() {
-                    return Err(eyre!(
-                        "Key index slice out of bounds for key_id {} (end {}, len {})",
-                        key_id,
-                        end_idx,
-                        raw_data.len()
-                    ));
-                }
-                let raw_data = &raw_data[start_idx..end_idx];
-                let data = raw_data.chunks_exact(8).map(TryInto::try_into).map(Result::unwrap).map(f64::from_le_bytes);
-                let period_offset = usize::try_from(ki.period_offset)
-                    .map_err(|_| eyre!("Invalid period_offset for key_id {}", key_id))?;
+                let raw_slice = slice_bin_f64_bytes(&mmap[..], ki.position, ki.length).map_err(|e| {
+                eyre!(
+                    "BIN slice error for key_id {} (period_type_id={}, pos_bytes={}, len_values={}, mmap_len_bytes={}): {:?}",
+                    key_id,
+                    ki.period_type_id,
+                    ki.position,
+                    ki.length,
+                    mmap.len(),
+                    e
+                )
+            })?;
 
-                // dimension 1 is the enumerated time
-                for (block_id, value) in data.enumerate() {
+                let period_offset = period_offset_u64(ki.period_offset).map_err(|e| {
+                    eyre!("period_offset error for key_id {} (period_offset={}): {:?}", key_id, ki.period_offset, e)
+                })?;
+
+                for (i, chunk) in raw_slice.chunks_exact(8).enumerate() {
+                    let value = f64::from_le_bytes(chunk.try_into().unwrap());
+
+                    let block_id_u64 = (i as u64)
+                        .checked_add(period_offset)
+                        .and_then(|x| x.checked_add(1))
+                        .ok_or_else(|| eyre!("block_id overflow for key_id {}", key_id))?;
+
+                    let block_id_i64: i64 =
+                        block_id_u64.try_into().map_err(|_| eyre!("block_id exceeds i64 for key_id {}", key_id))?;
+
                     appender.append_row(duckdb::params![
                         key_id,
-                        sample_id,
-                        band_id,
-                        membership_id,
-                        block_id + period_offset + 1,
+                        key.sample_id,
+                        key.band_id,
+                        key.membership_id,
+                        block_id_i64,
                         value
                     ])?;
                 }
             }
+
             appender.flush()?;
 
             if let Some(report) = progress.as_mut() {
