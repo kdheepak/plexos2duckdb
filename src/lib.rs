@@ -261,8 +261,8 @@ type KeyId = i64;
 struct KeyIndex {
     key_id: KeyId,                // key_id
     period_type_id: PeriodTypeId, // period_type_id
-    length: usize,                // in 8-byte (64-bit float) increments
-    position: usize,              // bytes from binary file start
+    length: u64,                  // in 8-byte (64-bit float) increments
+    position: u64,                // bytes from binary file start
     period_offset: i64,           // temporal data offset (if any) in stored times
 }
 
@@ -1806,13 +1806,40 @@ impl SolutionDataset {
                 let sample_id = key.sample_id;
                 let membership_id = key.membership_id;
 
-                let start_idx = ki.position;
-                let end_idx = ki.position + 8 * ki.length;
+                let byte_len = ki
+                    .length
+                    .checked_mul(8)
+                    .ok_or_else(|| eyre!("Key index length overflow for key_id {}", key_id))?;
+                let end_idx = ki
+                    .position
+                    .checked_add(byte_len)
+                    .ok_or_else(|| eyre!("Key index position overflow for key_id {}", key_id))?;
                 let raw_data =
                     self.period_data.get(&ki.period_type_id).ok_or_else(|| eyre!("period type not found"))?;
+                let start_idx = usize::try_from(ki.position).map_err(|_| {
+                    eyre!(
+                        "Key index position exceeds addressable memory for key_id {}. On 32-bit builds, files >4GB are not supported.",
+                        key_id
+                    )
+                })?;
+                let end_idx = usize::try_from(end_idx).map_err(|_| {
+                    eyre!(
+                        "Key index end exceeds addressable memory for key_id {}. On 32-bit builds, files >4GB are not supported.",
+                        key_id
+                    )
+                })?;
+                if end_idx > raw_data.len() {
+                    return Err(eyre!(
+                        "Key index slice out of bounds for key_id {} (end {}, len {})",
+                        key_id,
+                        end_idx,
+                        raw_data.len()
+                    ));
+                }
                 let raw_data = &raw_data[start_idx..end_idx];
                 let data = raw_data.chunks_exact(8).map(TryInto::try_into).map(Result::unwrap).map(f64::from_le_bytes);
-                let period_offset = ki.period_offset as usize;
+                let period_offset =
+                    usize::try_from(ki.period_offset).map_err(|_| eyre!("Invalid period_offset for key_id {}", key_id))?;
 
                 // dimension 1 is the enumerated time
                 for (block_id, value) in data.enumerate() {
