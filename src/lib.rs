@@ -369,13 +369,105 @@ pub enum ProgressEvent {
     DataTableEnd,
 }
 
+#[derive(Debug)]
+enum DuckdbProgress {
+    Report(String),
+    Event(ProgressEvent),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum DbWriteMode {
     InMemoryThenCopy,
     Direct,
 }
 
+pub struct DuckdbBuilder<'a> {
+    dataset: &'a SolutionDataset,
+    db_path: std::path::PathBuf,
+    mode: DbWriteMode,
+    report: Option<&'a mut dyn FnMut(&str)>,
+    progress: Option<&'a mut dyn FnMut(ProgressEvent)>,
+}
+
+impl<'a> DuckdbBuilder<'a> {
+    fn new<P: AsRef<std::path::Path>>(dataset: &'a SolutionDataset, db_path: P) -> Self {
+        Self {
+            dataset,
+            db_path: db_path.as_ref().to_path_buf(),
+            mode: DbWriteMode::InMemoryThenCopy,
+            report: None,
+            progress: None,
+        }
+    }
+
+    pub fn with_mode(mut self, mode: DbWriteMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_progress(mut self, report: &'a mut dyn FnMut(&str)) -> Self {
+        self.report = Some(report);
+        self
+    }
+
+    pub fn with_events(mut self, progress: &'a mut dyn FnMut(ProgressEvent)) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub fn run(mut self) -> Result<()> {
+        let mut report = self.report.take();
+        let mut progress = self.progress.take();
+        let has_callbacks = report.is_some() || progress.is_some();
+        let mut combined = |update: DuckdbProgress| {
+            match update {
+                DuckdbProgress::Report(msg) => {
+                    if let Some(report) = report.as_mut() {
+                        report(msg.as_str());
+                    }
+                },
+                DuckdbProgress::Event(event) => {
+                    if let Some(progress) = progress.as_mut() {
+                        progress(event);
+                    }
+                },
+            }
+        };
+        let combined_opt = if has_callbacks { Some(&mut combined as &mut dyn FnMut(DuckdbProgress)) } else { None };
+        self.dataset.to_duckdb_impl(&self.db_path, combined_opt, self.mode)
+    }
+}
+
 impl SolutionDataset {
+    fn with_duckdb_step<R>(
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+        index: &mut usize,
+        total: usize,
+        label: &str,
+        f: impl FnOnce(&mut Option<&mut dyn FnMut(DuckdbProgress)>) -> Result<R>,
+    ) -> Result<R> {
+        *index += 1;
+        if let Some(report) = progress.as_mut() {
+            report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
+                index: *index,
+                total,
+                table_name: label.to_string(),
+                keys: 0,
+            }));
+        }
+        let result = f(progress);
+        if let Some(report) = progress.as_mut() {
+            report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
+        }
+        result
+    }
+
+    fn report_duckdb_progress(progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>, msg: &str) {
+        if let Some(report) = progress.as_mut() {
+            report(DuckdbProgress::Report(msg.to_string()));
+        }
+    }
+
     fn report_progress(progress: &mut Option<&mut dyn FnMut(&str)>, msg: &str) {
         if let Some(report) = progress.as_mut() {
             report(msg);
@@ -1266,130 +1358,174 @@ impl SolutionDataset {
         Ok(())
     }
 
-    pub fn to_duckdb<P: AsRef<std::path::Path>>(&self, db_path: P) -> Result<()> {
-        self.to_duckdb_impl(db_path, None, None, DbWriteMode::InMemoryThenCopy)
-    }
-
-    pub fn to_duckdb_with_progress<P: AsRef<std::path::Path>>(
-        &self,
-        db_path: P,
-        report: &mut dyn FnMut(&str),
-    ) -> Result<()> {
-        self.to_duckdb_impl(db_path, Some(report), None, DbWriteMode::InMemoryThenCopy)
-    }
-
-    pub fn to_duckdb_with_progress_events<P: AsRef<std::path::Path>>(
-        &self,
-        db_path: P,
-        report: &mut dyn FnMut(&str),
-        progress: &mut dyn FnMut(ProgressEvent),
-    ) -> Result<()> {
-        self.to_duckdb_impl(db_path, Some(report), Some(progress), DbWriteMode::InMemoryThenCopy)
-    }
-
-    pub fn to_duckdb_with_progress_events_mode<P: AsRef<std::path::Path>>(
-        &self,
-        db_path: P,
-        report: &mut dyn FnMut(&str),
-        progress: &mut dyn FnMut(ProgressEvent),
-        mode: DbWriteMode,
-    ) -> Result<()> {
-        self.to_duckdb_impl(db_path, Some(report), Some(progress), mode)
-    }
-
-    pub fn to_duckdb_mode<P: AsRef<std::path::Path>>(&self, db_path: P, mode: DbWriteMode) -> Result<()> {
-        self.to_duckdb_impl(db_path, None, None, mode)
+    pub fn to_duckdb<P: AsRef<std::path::Path>>(&self, db_path: P) -> DuckdbBuilder<'_> {
+        DuckdbBuilder::new(self, db_path)
     }
 
     fn to_duckdb_impl<P: AsRef<std::path::Path>>(
         &self,
         db_path: P,
-        mut report: Option<&mut dyn FnMut(&str)>,
-        mut progress: Option<&mut dyn FnMut(ProgressEvent)>,
+        mut progress: Option<&mut dyn FnMut(DuckdbProgress)>,
         mode: DbWriteMode,
     ) -> Result<()> {
         let db_path = db_path.as_ref();
-        Self::report_progress(&mut report, "Initializing DuckDB");
-        let mut con = match mode {
-            DbWriteMode::InMemoryThenCopy => duckdb::Connection::open_in_memory()?,
-            DbWriteMode::Direct => duckdb::Connection::open(db_path)?,
-        };
+        let total_steps = 28;
+        let mut step_index = 0;
+        Self::report_duckdb_progress(&mut progress, "Initializing DuckDB");
+        let mut con =
+            Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Initializing DuckDB", |_progress| {
+                match mode {
+                    DbWriteMode::InMemoryThenCopy => Ok(duckdb::Connection::open_in_memory()?),
+                    DbWriteMode::Direct => Ok(duckdb::Connection::open(db_path)?),
+                }
+            })?;
 
-        Self::report_progress(&mut report, "Configuring DuckDB session");
-        con.execute_batch("SET preserve_insertion_order = false;")?;
-        if let DbWriteMode::Direct = mode {
-            con.execute_batch("PRAGMA enable_checkpoint_on_shutdown;")?;
-        }
+        Self::report_duckdb_progress(&mut progress, "Configuring DuckDB session");
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Configuring DuckDB session",
+            |_progress| {
+                con.execute_batch("SET preserve_insertion_order = false;")?;
+                if let DbWriteMode::Direct = mode {
+                    con.execute_batch("PRAGMA enable_checkpoint_on_shutdown;")?;
+                }
+                Ok(())
+            },
+        )?;
 
-        Self::report_progress(&mut report, "Creating raw schema");
-        con.execute_batch("CREATE SCHEMA IF NOT EXISTS raw;")?;
+        Self::report_duckdb_progress(&mut progress, "Creating raw schema");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Creating raw schema", |_progress| {
+            con.execute_batch("CREATE SCHEMA IF NOT EXISTS raw;")?;
+            Ok(())
+        })?;
 
-        Self::report_progress(&mut report, "Writing metadata");
-        self.populate_table_metadata(&mut con)?;
+        Self::report_duckdb_progress(&mut progress, "Writing metadata");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing metadata", |progress| {
+            self.populate_table_metadata(&mut con, progress)
+        })?;
 
-        Self::report_progress(&mut report, "Writing config");
-        self.populate_table_config(&mut con)?;
-        Self::report_progress(&mut report, "Writing memberships");
-        self.populate_table_memberships(&mut con)?;
-        Self::report_progress(&mut report, "Writing collections");
-        self.populate_table_collections(&mut con)?;
-        Self::report_progress(&mut report, "Writing classes");
-        self.populate_table_classes(&mut con)?;
-        Self::report_progress(&mut report, "Writing class groups");
-        self.populate_table_class_groups(&mut con)?;
-        Self::report_progress(&mut report, "Writing categories");
-        self.populate_table_categories(&mut con)?;
-        Self::report_progress(&mut report, "Writing bands");
-        self.populate_table_bands(&mut con)?;
-        Self::report_progress(&mut report, "Writing models");
-        self.populate_table_models(&mut con)?;
-        Self::report_progress(&mut report, "Writing objects");
-        self.populate_table_objects(&mut con)?;
-        Self::report_progress(&mut report, "Writing keys");
-        self.populate_table_keys(&mut con)?;
-        Self::report_progress(&mut report, "Writing key indexes");
-        self.populate_table_key_indexes(&mut con)?;
-        Self::report_progress(&mut report, "Writing properties");
-        self.populate_table_properties(&mut con)?;
-        Self::report_progress(&mut report, "Writing timeslices");
-        self.populate_table_timeslices(&mut con)?;
-        Self::report_progress(&mut report, "Writing samples");
-        self.populate_table_samples(&mut con)?;
-        Self::report_progress(&mut report, "Writing units");
-        self.populate_table_units(&mut con)?;
-        Self::report_progress(&mut report, "Writing memo objects");
-        self.populate_table_memo_objects(&mut con)?;
-        Self::report_progress(&mut report, "Writing custom columns");
-        self.populate_table_custom_columns(&mut con)?;
-        Self::report_progress(&mut report, "Writing attribute data");
-        self.populate_table_attribute_data(&mut con)?;
-        Self::report_progress(&mut report, "Writing attributes");
-        self.populate_table_attributes(&mut con)?;
-        Self::report_progress(&mut report, "Writing timestamp blocks");
-        self.populate_table_timestamps_block(&mut con)?;
+        Self::report_duckdb_progress(&mut progress, "Writing config");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing config", |progress| {
+            self.populate_table_config(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing memberships");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing memberships", |progress| {
+            self.populate_table_memberships(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing collections");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing collections", |progress| {
+            self.populate_table_collections(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing classes");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing classes", |progress| {
+            self.populate_table_classes(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing class groups");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing class groups", |progress| {
+            self.populate_table_class_groups(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing categories");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing categories", |progress| {
+            self.populate_table_categories(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing bands");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing bands", |progress| {
+            self.populate_table_bands(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing models");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing models", |progress| {
+            self.populate_table_models(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing objects");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing objects", |progress| {
+            self.populate_table_objects(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing keys");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing keys", |progress| {
+            self.populate_table_keys(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing key indexes");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing key indexes", |progress| {
+            self.populate_table_key_indexes(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing properties");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing properties", |progress| {
+            self.populate_table_properties(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing timeslices");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing timeslices", |progress| {
+            self.populate_table_timeslices(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing samples");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing samples", |progress| {
+            self.populate_table_samples(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing units");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing units", |progress| {
+            self.populate_table_units(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing memo objects");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing memo objects", |progress| {
+            self.populate_table_memo_objects(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing custom columns");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing custom columns", |progress| {
+            self.populate_table_custom_columns(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing attribute data");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing attribute data", |progress| {
+            self.populate_table_attribute_data(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing attributes");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing attributes", |progress| {
+            self.populate_table_attributes(&mut con, progress)
+        })?;
+        Self::report_duckdb_progress(&mut progress, "Writing timestamp blocks");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing timestamp blocks", |progress| {
+            self.populate_table_timestamps_block(&mut con, progress)
+        })?;
 
-        Self::report_progress(&mut report, "Writing time series data");
-        self.populate_table_data(&mut con, &mut progress)?;
+        Self::report_duckdb_progress(&mut progress, "Writing time series data");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing time series data", |progress| {
+            self.populate_table_data(&mut con, progress)
+        })?;
 
-        Self::report_progress(&mut report, "Creating processed views");
-        self.create_processed_views(&mut con)?;
+        Self::report_duckdb_progress(&mut progress, "Creating processed views");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Creating processed views", |_progress| {
+            self.create_processed_views(&mut con)?;
+            Ok(())
+        })?;
 
-        Self::report_progress(&mut report, "Creating report views");
-        self.create_report_views(&mut con)?;
+        Self::report_duckdb_progress(&mut progress, "Creating report views");
+        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Creating report views", |_progress| {
+            self.create_report_views(&mut con)?;
+            Ok(())
+        })?;
 
-        Self::report_progress(&mut report, "Persisting DuckDB database");
-        if let DbWriteMode::InMemoryThenCopy = mode {
-            con.execute_batch(&format!(
-                "
-                  ATTACH '{}' as my_database;
-                  COPY FROM DATABASE memory TO my_database;
-                  DETACH my_database;
-                ",
-                db_path.to_str().unwrap_or_default()
-            ))?;
-        } else {
-            con.execute_batch("CHECKPOINT;")?;
-        }
+        Self::report_duckdb_progress(&mut progress, "Persisting DuckDB database");
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Persisting DuckDB database",
+            |_progress| {
+                if let DbWriteMode::InMemoryThenCopy = mode {
+                    con.execute_batch(&format!(
+                        "
+                          ATTACH '{}' as my_database;
+                          COPY FROM DATABASE memory TO my_database;
+                          DETACH my_database;
+                        ",
+                        db_path.to_str().unwrap_or_default()
+                    ))?;
+                } else {
+                    con.execute_batch("CHECKPOINT;")?;
+                }
+                Ok(())
+            },
+        )?;
 
         Ok(())
     }
@@ -1397,19 +1533,19 @@ impl SolutionDataset {
     fn populate_table_data(
         &self,
         con: &mut duckdb::Connection,
-        progress: &mut Option<&mut dyn FnMut(ProgressEvent)>,
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
         let total_tables = self.table_key_index_mapping.len();
         for (table_idx, (table_name, key_ids)) in self.table_key_index_mapping.clone().into_iter().enumerate() {
             if let Some(report) = progress.as_mut() {
-                report(ProgressEvent::DataTableStart {
+                report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
                     index: table_idx + 1,
                     total: total_tables,
                     table_name: table_name.clone(),
                     keys: key_ids.len(),
-                });
+                }));
             }
 
             con.execute_batch(&format!(
@@ -1437,11 +1573,7 @@ impl SolutionDataset {
                     .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
 
                 if ki.position % 8 != 0 {
-                    return Err(eyre!(
-                        "BIN position misaligned for key_id {} (pos_bytes={})",
-                        key_id,
-                        ki.position
-                    ));
+                    return Err(eyre!("BIN position misaligned for key_id {} (pos_bytes={})", key_id, ki.position));
                 }
 
                 let mut reader = BufReader::new(file.try_clone()?);
@@ -1476,14 +1608,18 @@ impl SolutionDataset {
             appender.flush()?;
 
             if let Some(report) = progress.as_mut() {
-                report(ProgressEvent::DataTableEnd);
+                report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
             }
         }
 
         Ok(())
     }
 
-    fn populate_table_config(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_config(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
             CREATE TABLE raw.config (
@@ -1505,7 +1641,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_memberships(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_memberships(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TYPE object_kind AS ENUM ('object', 'relation');
@@ -1569,7 +1709,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_collections(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_collections(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.collections (
@@ -1599,7 +1743,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_classes(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_classes(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.classes (
@@ -1621,7 +1769,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_class_groups(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_class_groups(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.class_groups (
@@ -1642,7 +1794,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_categories(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_categories(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.categories (
@@ -1670,7 +1826,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_bands(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_bands(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.bands (
@@ -1690,7 +1850,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_models(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_models(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.models (
@@ -1711,7 +1875,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_objects(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_objects(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.objects (
@@ -1743,7 +1911,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_keys(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_keys(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.keys (
@@ -1781,7 +1953,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_key_indexes(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_key_indexes(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.key_indexes (
@@ -1811,7 +1987,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_properties(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_properties(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.properties (
@@ -1848,7 +2028,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_timeslices(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_timeslices(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.timeslices (
@@ -1866,7 +2050,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_samples(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_samples(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.samples (
@@ -1896,7 +2084,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_units(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_units(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.units (
@@ -1915,7 +2107,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_memo_objects(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_memo_objects(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.memo_objects (
@@ -1934,7 +2130,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_custom_columns(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_custom_columns(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.custom_columns (
@@ -1954,7 +2154,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_attribute_data(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_attribute_data(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.attribute_data (
@@ -1975,7 +2179,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_attributes(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_attributes(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch(
             "
               CREATE TABLE raw.attributes (
@@ -2003,7 +2211,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_metadata(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_metadata(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         con.execute_batch("CREATE TABLE main.plexos2duckdb (\n  key TEXT,\n  value TEXT\n);")?;
 
         let mut appender = con.appender("plexos2duckdb")?;
@@ -2022,7 +2234,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn populate_table_timestamps_block(&self, con: &mut duckdb::Connection) -> Result<()> {
+    fn populate_table_timestamps_block(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
         for (name, values) in self.timestamp_block.iter() {
             con.execute_batch(&format!(
                 "

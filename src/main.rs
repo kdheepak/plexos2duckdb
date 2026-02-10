@@ -262,9 +262,14 @@ fn run(args: Args) -> Result<()> {
     let mode =
         if args.in_memory { plexos2duckdb::DbWriteMode::InMemoryThenCopy } else { plexos2duckdb::DbWriteMode::Direct };
     if args.no_progress_bar {
-        dataset.to_duckdb_mode(&output_path, mode)?;
+        dataset.to_duckdb(&output_path).with_mode(mode).run()?;
     } else {
-        dataset.to_duckdb_with_progress_events_mode(&output_path, &mut report, &mut report_data, mode)?;
+        dataset
+            .to_duckdb(&output_path)
+            .with_mode(mode)
+            .with_progress(&mut report)
+            .with_events(&mut report_data)
+            .run()?;
     }
     if let Some(spinner) = pb.as_ref() {
         if !last_msg.is_empty() {
