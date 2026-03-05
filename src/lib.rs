@@ -1401,13 +1401,13 @@ impl SolutionDataset {
         let db_path = db_path.as_ref();
         let total_steps = 28;
         let mut step_index = 0;
+        let mut direct_stage_dir = None;
         Self::report_duckdb_progress(&mut progress, "Initializing DuckDB");
         let mut con =
             Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Initializing DuckDB", |_progress| {
-                match mode {
-                    DbWriteMode::InMemoryThenCopy => Ok(duckdb::Connection::open_in_memory()?),
-                    DbWriteMode::Direct => Ok(duckdb::Connection::open(db_path)?),
-                }
+                let (con, stage_dir) = Self::open_duckdb_write_connection(db_path, mode)?;
+                direct_stage_dir = stage_dir;
+                Ok(con)
             })?;
 
         Self::report_duckdb_progress(&mut progress, "Configuring DuckDB session");
@@ -1418,9 +1418,6 @@ impl SolutionDataset {
             "Configuring DuckDB session",
             |_progress| {
                 con.execute_batch("SET preserve_insertion_order = false;")?;
-                if let DbWriteMode::Direct = mode {
-                    con.execute_batch("PRAGMA enable_checkpoint_on_shutdown;")?;
-                }
                 Ok(())
             },
         )?;
@@ -1540,24 +1537,11 @@ impl SolutionDataset {
             &mut step_index,
             total_steps,
             "Persisting DuckDB database",
-            |_progress| {
-                if let DbWriteMode::InMemoryThenCopy = mode {
-                    let db_path_sql = Self::sql_string_literal(db_path.to_str().unwrap_or_default());
-                    con.execute_batch(&format!(
-                        "
-                          ATTACH '{}' as my_database;
-                          COPY FROM DATABASE memory TO my_database;
-                          DETACH my_database;
-                        ",
-                        db_path_sql
-                    ))?;
-                } else {
-                    con.execute_batch("CHECKPOINT;")?;
-                }
-                Ok(())
-            },
+            |_progress| Self::persist_duckdb_database(&mut con, db_path, mode),
         )?;
 
+        drop(con);
+        drop(direct_stage_dir);
         Ok(())
     }
 
@@ -1932,6 +1916,50 @@ impl SolutionDataset {
         } else {
             Err(eyre!("Failed to resolve current DuckDB catalog name"))
         }
+    }
+
+    fn open_duckdb_write_connection(
+        db_path: &std::path::Path,
+        mode: DbWriteMode,
+    ) -> Result<(duckdb::Connection, Option<tempfile::TempDir>)> {
+        match mode {
+            DbWriteMode::InMemoryThenCopy => Ok((duckdb::Connection::open_in_memory()?, None)),
+            DbWriteMode::Direct => {
+                let staging_parent = db_path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let staging_dir = tempfile::Builder::new().prefix("plexos2duckdb-stage-").tempdir_in(staging_parent)?;
+                let staging_path = staging_dir.path().join("stage.duckdb");
+                Ok((duckdb::Connection::open(staging_path)?, Some(staging_dir)))
+            },
+        }
+    }
+
+    fn persist_duckdb_database(
+        con: &mut duckdb::Connection,
+        db_path: &std::path::Path,
+        mode: DbWriteMode,
+    ) -> Result<()> {
+        let target_catalog_ident = Self::quote_ident("persisted_database");
+        let target_db_path = Self::sql_string_literal(db_path.to_string_lossy().as_ref());
+        let source_catalog_ident = Self::quote_ident(&Self::current_catalog_name(con)?);
+
+        con.execute_batch("PRAGMA force_checkpoint;")?;
+
+        if let DbWriteMode::Direct = mode {
+            con.execute_batch("CHECKPOINT;")?;
+        }
+
+        con.execute_batch(&format!(
+            "
+              ATTACH '{target_db_path}' AS {target_catalog_ident};
+              COPY FROM DATABASE {source_catalog_ident} TO {target_catalog_ident};
+              CHECKPOINT {target_catalog_ident};
+              DETACH {target_catalog_ident};
+            "
+        ))?;
+        Ok(())
     }
 
     fn read_exact_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
@@ -2968,6 +2996,57 @@ impl SolutionDataset {
         println!("  config: {}", self.config.len());
         println!("  attribute data: {}", self.attribute_data.len());
         println!("  period data: {}", self.period_data.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_small_database(mode: DbWriteMode) -> Result<(tempfile::TempDir, std::path::PathBuf)> {
+        let output_dir = tempfile::TempDir::new()?;
+        let db_path = output_dir.path().join("result.duckdb");
+        let (mut con, stage_dir) = SolutionDataset::open_duckdb_write_connection(&db_path, mode)?;
+
+        con.execute_batch(
+            "
+              CREATE TABLE numbers(value INTEGER);
+              INSERT INTO numbers VALUES (1), (2), (3);
+            ",
+        )?;
+        SolutionDataset::persist_duckdb_database(&mut con, &db_path, mode)?;
+
+        drop(con);
+        drop(stage_dir);
+        Ok((output_dir, db_path))
+    }
+
+    fn assert_small_database(db_path: &std::path::Path) -> Result<()> {
+        let wal_path = std::path::PathBuf::from(format!("{}.wal", db_path.to_string_lossy()));
+        assert!(db_path.exists(), "expected persisted database at {}", db_path.display());
+        assert!(!wal_path.exists(), "expected checkpointed database without WAL sidecar at {}", wal_path.display());
+
+        let con = duckdb::Connection::open(db_path)?;
+        let mut stmt = con.prepare("SELECT COUNT(*), SUM(value) FROM numbers;")?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.ok_or_else(|| eyre!("expected numbers query to return a row"))?;
+        let row_count: i64 = row.get(0)?;
+        let total: i64 = row.get(1)?;
+        assert_eq!(row_count, 3);
+        assert_eq!(total, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn persist_in_memory_mode_uses_copy_and_checkpoint() -> Result<()> {
+        let (_output_dir, db_path) = build_small_database(DbWriteMode::InMemoryThenCopy)?;
+        assert_small_database(&db_path)
+    }
+
+    #[test]
+    fn persist_direct_mode_uses_copy_and_checkpoint() -> Result<()> {
+        let (_output_dir, db_path) = build_small_database(DbWriteMode::Direct)?;
+        assert_small_database(&db_path)
     }
 }
 
