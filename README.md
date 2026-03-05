@@ -59,7 +59,7 @@ and [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) i
 
    The compiled binary will be located at:
 
-   ```
+   ```text
    target/release/plexos2duckdb
    ```
 
