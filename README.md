@@ -106,6 +106,13 @@ Inspect an existing database to view converter metadata, source file info, model
 plexos2duckdb inspect --input "Model-DayAhead-Solution.duckdb"
 ```
 
+For machine-readable diagnostics in automation or CI, use JSON output:
+
+```shell
+plexos2duckdb inspect --input "Model-DayAhead-Solution.duckdb" --format-diagnostics json
+plexos2duckdb convert --input "Model-DayAhead-Solution.zip" --output "Model-DayAhead-Solution.duckdb" --format-diagnostics json
+```
+
 You may use any [duckdb compatible database viewer](https://duckdb.org/docs/stable/core_extensions/ui) to interactively explore the data with SQL:
 
 <img width="1728" height="775" alt="image" src="https://github.com/user-attachments/assets/ad829556-bef1-4982-b7b3-f7a62d225985" />

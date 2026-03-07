@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::{
     Result,
     eyre::{ContextCompat, eyre},
@@ -10,6 +10,7 @@ use ctrlc;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
 use plexos2duckdb;
+use serde::Serialize;
 use tabled::{Table, Tabled, settings::Style};
 
 #[derive(Parser)]
@@ -25,6 +26,12 @@ enum Command {
     Convert(ConvertArgs),
     /// Show operational metadata from a generated DuckDB database
     Inspect(InspectArgs),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
 }
 
 #[derive(Parser, Debug)]
@@ -50,6 +57,9 @@ struct ConvertArgs {
     /// Number of threads to use when writing time series data tables
     #[arg(long)]
     n_threads: Option<std::num::NonZeroUsize>,
+    /// Output format for diagnostics and results
+    #[arg(long = "format-diagnostics", value_enum, default_value_t = OutputFormat::Text)]
+    format_diagnostics: OutputFormat,
 }
 
 #[derive(Parser, Debug)]
@@ -57,9 +67,12 @@ struct InspectArgs {
     /// Path to a generated DuckDB database
     #[arg(short, long)]
     input: std::path::PathBuf,
+    /// Output format for inspected metadata and inventory
+    #[arg(long = "format-diagnostics", value_enum, default_value_t = OutputFormat::Text)]
+    format_diagnostics: OutputFormat,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct DatabaseMetadata {
     database: String,
     converter_version: String,
@@ -73,12 +86,51 @@ struct MetadataRow {
     value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Tabled)]
+#[derive(Debug, Clone, PartialEq, Eq, Tabled, Serialize)]
 struct TableInventoryRow {
     schema: String,
     table: String,
     kind: String,
     row_count: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConvertJsonEnvelope {
+    timestamp: String,
+    #[serde(flatten)]
+    event: ConvertJsonEvent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum ConvertJsonEvent {
+    Status { message: String },
+    DataTableStart { index: usize, total: usize, table_name: String, keys: usize },
+    DataTableEnd,
+    DataWorkerTableStart { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
+    DataWorkerTableEnd { worker_id: usize, index: usize, total: usize },
+    DataMergeTableStart { index: usize, total: usize, table_name: String },
+    DataMergeTableEnd { index: usize, total: usize },
+    Summary { input: String, model_name: String },
+    Completed { output: String },
+}
+
+#[derive(Debug, Serialize)]
+struct InspectJsonOutput {
+    metadata: DatabaseMetadata,
+    inventory: Vec<TableInventoryRow>,
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
+
+fn print_convert_json_event(event: ConvertJsonEvent) -> Result<()> {
+    print_json(&ConvertJsonEnvelope {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        event,
+    })
 }
 
 fn resolve_input_path(input: &std::path::Path) -> Result<std::path::PathBuf> {
@@ -135,7 +187,6 @@ fn resolve_output_path(
 fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
-
 
 fn metadata_value(metadata: &std::collections::HashMap<String, String>, key: &str) -> Result<String> {
     metadata.get(key).cloned().ok_or_else(|| eyre!("Missing metadata key in main.plexos2duckdb: {key}"))
@@ -206,6 +257,10 @@ fn inspect_database(args: InspectArgs) -> Result<()> {
     metadata.database = args.input.display().to_string();
     let inventory = load_table_inventory(&con)?;
 
+    if args.format_diagnostics == OutputFormat::Json {
+        return print_json(&InspectJsonOutput { metadata, inventory });
+    }
+
     let metadata_rows = vec![
         MetadataRow { field: "database".to_string(), value: metadata.database },
         MetadataRow { field: "converter version".to_string(), value: metadata.converter_version },
@@ -222,6 +277,7 @@ fn inspect_database(args: InspectArgs) -> Result<()> {
 }
 
 fn convert(args: ConvertArgs) -> Result<()> {
+    let json_mode = args.format_diagnostics == OutputFormat::Json;
     let input_path = resolve_input_path(&args.input)?;
     let input_dir = input_path.parent().ok_or_else(|| eyre!("Input path has no parent directory"))?;
     let output_path = resolve_output_path(&input_path, args.output, args.force)?;
@@ -238,7 +294,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
     let mut last_mark = None;
     let mut total_line = None;
     let mut term = None;
-    if !args.no_progress_bar {
+    if !args.no_progress_bar && !json_mode {
         let term_handle = Term::stderr();
         let _ = term_handle.hide_cursor();
         let multi = MultiProgress::new();
@@ -269,6 +325,10 @@ fn convert(args: ConvertArgs) -> Result<()> {
     }
     let _cursor_guard = CursorGuard(term.clone());
     let mut report = |msg: &str| {
+        if json_mode {
+            let _ = print_convert_json_event(ConvertJsonEvent::Status { message: msg.to_string() });
+            return;
+        }
         if let Some(spinner) = pb.as_ref() {
             if msg != last_msg {
                 let now = Instant::now();
@@ -291,6 +351,28 @@ fn convert(args: ConvertArgs) -> Result<()> {
     };
 
     let mut report_data = |event: plexos2duckdb::ProgressEvent| {
+        if json_mode {
+            let json_event = match event {
+                plexos2duckdb::ProgressEvent::DataTableStart { index, total, table_name, keys } => {
+                    ConvertJsonEvent::DataTableStart { index, total, table_name, keys }
+                },
+                plexos2duckdb::ProgressEvent::DataTableEnd => ConvertJsonEvent::DataTableEnd,
+                plexos2duckdb::ProgressEvent::DataWorkerTableStart { worker_id, index, total, table_name, keys } => {
+                    ConvertJsonEvent::DataWorkerTableStart { worker_id, index, total, table_name, keys }
+                },
+                plexos2duckdb::ProgressEvent::DataWorkerTableEnd { worker_id, index, total } => {
+                    ConvertJsonEvent::DataWorkerTableEnd { worker_id, index, total }
+                },
+                plexos2duckdb::ProgressEvent::DataMergeTableStart { index, total, table_name } => {
+                    ConvertJsonEvent::DataMergeTableStart { index, total, table_name }
+                },
+                plexos2duckdb::ProgressEvent::DataMergeTableEnd { index, total } => {
+                    ConvertJsonEvent::DataMergeTableEnd { index, total }
+                },
+            };
+            let _ = print_convert_json_event(json_event);
+            return;
+        }
         if args.no_progress_bar {
             return;
         }
@@ -445,8 +527,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
         }
     };
 
-    let run_stats = input_dir.join(std::path::Path::new("runstats.json"));
-    let dataset = if let Ok(run_stats) = std::fs::read_to_string(&run_stats) {
+    let dataset = if let Ok(run_stats) = std::fs::read_to_string(input_dir.join("runstats.json")) {
         report("Reading run stats");
         dataset.with_run_stats(run_stats)
     } else {
@@ -454,6 +535,13 @@ fn convert(args: ConvertArgs) -> Result<()> {
     };
 
     if args.print_summary {
+        if json_mode {
+            print_convert_json_event(ConvertJsonEvent::Summary {
+                input: input_path.display().to_string(),
+                model_name: model_name.to_string(),
+            })?;
+            return Ok(());
+        }
         if let Some(spinner) = pb.as_ref() {
             if !last_msg.is_empty() {
                 let now = Instant::now();
@@ -482,6 +570,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
         dataset.print_summary();
         return Ok(());
     }
+
     report("Creating DuckDB database");
     let mode =
         if args.in_memory { plexos2duckdb::DbWriteMode::InMemoryThenCopy } else { plexos2duckdb::DbWriteMode::Direct };
@@ -489,9 +578,16 @@ fn convert(args: ConvertArgs) -> Result<()> {
     if let Some(threads) = args.n_threads {
         builder = builder.with_data_write_threads(threads.get());
     }
-    let builder =
-        if !args.no_progress_bar { builder.with_progress(&mut report).with_events(&mut report_data) } else { builder };
+    let builder = if json_mode || !args.no_progress_bar {
+        builder.with_progress(&mut report).with_events(&mut report_data)
+    } else {
+        builder
+    };
     builder.run()?;
+    if json_mode {
+        print_convert_json_event(ConvertJsonEvent::Completed { output: output_path.display().to_string() })?;
+        return Ok(());
+    }
     if let Some(spinner) = pb.as_ref() {
         if !last_msg.is_empty() {
             let now = Instant::now();
@@ -645,6 +741,43 @@ mod tests {
         assert!(inventory_table.contains("row_count"));
         assert!(inventory_table.contains("items"));
         assert!(inventory_table.contains("3"));
+    }
+
+    #[test]
+    fn inspect_json_output_serializes_expected_fields() -> Result<()> {
+        let json = serde_json::to_string(&InspectJsonOutput {
+            metadata: DatabaseMetadata {
+                database: "/tmp/model.duckdb".to_string(),
+                converter_version: "1.2.3".to_string(),
+                source_file: "/tmp/input.zip".to_string(),
+                model_name: "Model A".to_string(),
+            },
+            inventory: vec![TableInventoryRow {
+                schema: "raw".to_string(),
+                table: "items".to_string(),
+                kind: "table".to_string(),
+                row_count: "3".to_string(),
+            }],
+        })?;
+
+        assert!(json.contains("\"metadata\""));
+        assert!(json.contains("\"converter_version\":\"1.2.3\""));
+        assert!(json.contains("\"inventory\""));
+        assert!(json.contains("\"row_count\":\"3\""));
+        Ok(())
+    }
+
+    #[test]
+    fn convert_json_event_serializes_expected_fields() -> Result<()> {
+        let json = serde_json::to_string(&ConvertJsonEnvelope {
+            timestamp: "2026-03-07T12:34:56Z".to_string(),
+            event: ConvertJsonEvent::Completed { output: "/tmp/out.duckdb".to_string() },
+        })?;
+        assert_eq!(
+            json,
+            "{\"timestamp\":\"2026-03-07T12:34:56Z\",\"event\":\"completed\",\"output\":\"/tmp/out.duckdb\"}"
+        );
+        Ok(())
     }
 
     #[test]
