@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Generator, Shell, generate};
 use color_eyre::{
     Result,
     eyre::{ContextCompat, eyre},
@@ -26,6 +27,9 @@ enum Command {
     Convert(ConvertArgs),
     /// Show operational metadata from a generated DuckDB database
     Inspect(InspectArgs),
+    /// Generate shell completion scripts
+    #[command(name = "generate-shell-completions")]
+    Completions(CompletionsArgs),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -71,6 +75,14 @@ struct InspectArgs {
     #[arg(long = "format-diagnostics", value_enum, default_value_t = OutputFormat::Text)]
     format_diagnostics: OutputFormat,
 }
+
+#[derive(Parser, Debug)]
+struct CompletionsArgs {
+    /// Shell to generate completion script for
+    #[arg(value_enum)]
+    shell: Shell,
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct DatabaseMetadata {
@@ -617,10 +629,31 @@ fn convert(args: ConvertArgs) -> Result<()> {
     Ok(())
 }
 
+fn print_completions<G: Generator>(generator: G) {
+    let mut cmd = Cli::command();
+    generate(generator, &mut cmd, "plexos2duckdb", &mut std::io::stdout());
+}
+
+fn generate_completions(args: CompletionsArgs) {
+    match args.shell {
+        Shell::Bash => print_completions(Shell::Bash),
+        Shell::Elvish => print_completions(Shell::Elvish),
+        Shell::Fish => print_completions(Shell::Fish),
+        Shell::PowerShell => print_completions(Shell::PowerShell),
+        Shell::Zsh => print_completions(Shell::Zsh),
+        _ => unreachable!("unsupported clap_complete shell variant"),
+    }
+}
+
+
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Convert(args) => convert(args),
         Command::Inspect(args) => inspect_database(args),
+        Command::Completions(args) => {
+            generate_completions(args);
+            Ok(())
+        },
     }
 }
 

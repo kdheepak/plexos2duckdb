@@ -113,6 +113,13 @@ plexos2duckdb inspect --input "Model-DayAhead-Solution.duckdb" --format-diagnost
 plexos2duckdb convert --input "Model-DayAhead-Solution.zip" --output "Model-DayAhead-Solution.duckdb" --format-diagnostics json
 ```
 
+Generate shell completions to stdout with the `generate-shell-completions` subcommand:
+
+```shell
+plexos2duckdb generate-shell-completions bash > ~/.local/share/bash-completion/completions/plexos2duckdb
+plexos2duckdb generate-shell-completions zsh > ~/.zfunc/_plexos2duckdb
+```
+
 You may use any [duckdb compatible database viewer](https://duckdb.org/docs/stable/core_extensions/ui) to interactively explore the data with SQL:
 
 <img width="1728" height="775" alt="image" src="https://github.com/user-attachments/assets/ad829556-bef1-4982-b7b3-f7a62d225985" />
