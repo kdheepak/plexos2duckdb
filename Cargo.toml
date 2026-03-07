@@ -27,6 +27,7 @@ regex = "1.12.3"
 roxmltree = "0.21.1"
 tempfile = "3.26.0"
 zip = "8.2.0"
+tabled = "0.20.0"
 
 [profile.release]
 debug = "line-tables-only"

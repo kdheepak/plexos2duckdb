@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use color_eyre::{
     Result,
     eyre::{ContextCompat, eyre},
@@ -10,10 +10,25 @@ use ctrlc;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
 use plexos2duckdb;
+use tabled::{Table, Tabled, settings::Style};
 
 #[derive(Parser)]
 #[command(author, version = plexos2duckdb::utils::version(), about, long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Convert a PLEXOS solution file to DuckDB
+    Convert(ConvertArgs),
+    /// Show operational metadata from a generated DuckDB database
+    Inspect(InspectArgs),
+}
+
+#[derive(Parser, Debug)]
+struct ConvertArgs {
     /// Path to the PLEXOS solution file or folder (either XML or ZIP containing XML, or solution folder)
     #[arg(short, long)]
     input: std::path::PathBuf,
@@ -35,6 +50,35 @@ struct Args {
     /// Number of threads to use when writing time series data tables
     #[arg(long)]
     n_threads: Option<std::num::NonZeroUsize>,
+}
+
+#[derive(Parser, Debug)]
+struct InspectArgs {
+    /// Path to a generated DuckDB database
+    #[arg(short, long)]
+    input: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseMetadata {
+    database: String,
+    converter_version: String,
+    source_file: String,
+    model_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Tabled)]
+struct MetadataRow {
+    field: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Tabled)]
+struct TableInventoryRow {
+    schema: String,
+    table: String,
+    kind: String,
+    row_count: String,
 }
 
 fn resolve_input_path(input: &std::path::Path) -> Result<std::path::PathBuf> {
@@ -76,16 +120,108 @@ fn resolve_output_path(
     let output_path = if let Some(output_path) = output { output_path } else { input.with_extension("duckdb") };
     let output_path =
         if output_path.extension().is_none() { output_path.with_extension("duckdb") } else { output_path };
-    if output_path.exists() && !force {
-        return Err(eyre!(
-            "Output file already exists: {}. Re-run with --force to overwrite it",
-            output_path.display()
-        ));
+    if output_path.exists() {
+        if !force {
+            return Err(eyre!(
+                "Output file already exists: \"{}\". Re-run with `--force` to overwrite it",
+                output_path.display().to_string().bold()
+            ));
+        }
+        std::fs::remove_file(&output_path)?;
     }
     Ok(output_path)
 }
 
-fn run(args: Args) -> Result<()> {
+fn quote_ident(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+
+fn metadata_value(metadata: &std::collections::HashMap<String, String>, key: &str) -> Result<String> {
+    metadata.get(key).cloned().ok_or_else(|| eyre!("Missing metadata key in main.plexos2duckdb: {key}"))
+}
+
+fn load_database_metadata(con: &duckdb::Connection) -> Result<DatabaseMetadata> {
+    let mut stmt = con.prepare("SELECT key, value FROM main.plexos2duckdb")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?.unwrap_or_default())))?;
+
+    let mut metadata = std::collections::HashMap::new();
+    for row in rows {
+        let (key, value) = row?;
+        metadata.insert(key, value);
+    }
+
+    Ok(DatabaseMetadata {
+        database: String::new(),
+        converter_version: metadata_value(&metadata, "plexos2duckdb_version")?,
+        source_file: metadata_value(&metadata, "plexos_file")?,
+        model_name: metadata_value(&metadata, "model_name")?,
+    })
+}
+
+fn load_table_inventory(con: &duckdb::Connection) -> Result<Vec<TableInventoryRow>> {
+    let mut stmt = con.prepare(
+        "
+        SELECT table_schema, table_name, table_type
+        FROM information_schema.tables
+        WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+        ORDER BY table_schema, table_name
+        ",
+    )?;
+    let tables = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut inventory = Vec::new();
+    for table in tables {
+        let (schema, table_name, table_type) = table?;
+        let kind = if table_type == "BASE TABLE" { "table" } else { "view" }.to_string();
+        let row_count = if table_type == "BASE TABLE" {
+            let sql = format!(
+                "SELECT COUNT(*) FROM {}.{}",
+                quote_ident(&schema),
+                quote_ident(&table_name)
+            );
+            let count: i64 = con.query_row(&sql, [], |row| row.get(0))?;
+            count.to_string()
+        } else {
+            "-".to_string()
+        };
+        inventory.push(TableInventoryRow { schema, table: table_name, kind, row_count });
+    }
+
+    Ok(inventory)
+}
+
+fn inspect_database(args: InspectArgs) -> Result<()> {
+    if !args.input.exists() {
+        return Err(eyre!("DuckDB file does not exist: {}", args.input.display()));
+    }
+    let con = duckdb::Connection::open(&args.input)?;
+    let mut metadata = load_database_metadata(&con)?;
+    metadata.database = args.input.display().to_string();
+    let inventory = load_table_inventory(&con)?;
+
+    let metadata_rows = vec![
+        MetadataRow { field: "database".to_string(), value: metadata.database },
+        MetadataRow { field: "converter version".to_string(), value: metadata.converter_version },
+        MetadataRow { field: "source file".to_string(), value: metadata.source_file },
+        MetadataRow { field: "model name".to_string(), value: metadata.model_name },
+    ];
+
+    println!("Metadata");
+    println!("{}", Table::new(metadata_rows).with(Style::rounded()));
+    println!();
+    println!("Inventory");
+    println!("{}", Table::new(inventory).with(Style::rounded()));
+    Ok(())
+}
+
+fn convert(args: ConvertArgs) -> Result<()> {
     let input_path = resolve_input_path(&args.input)?;
     let input_dir = input_path.parent().ok_or_else(|| eyre!("Input path has no parent directory"))?;
     let output_path = resolve_output_path(&input_path, args.output, args.force)?;
@@ -254,14 +390,13 @@ fn run(args: Args) -> Result<()> {
         }
     };
 
-    // Extract model name from the file name
     let file_name =
         input_path.file_name().context("File name must exist")?.to_str().context("File name must be valid UTF-8")?;
     let model_name = file_name
         .trim_start_matches("Model ")
-        .trim_end_matches(" Solution") // if input_path is a folder
-        .trim_end_matches(" Solution.zip") // if input_path is a zip file
-        .trim_end_matches(" Solution.xml"); // if input path is a xml file
+        .trim_end_matches(" Solution")
+        .trim_end_matches(" Solution.zip")
+        .trim_end_matches(" Solution.xml");
 
     let dataset = {
         let actual_input_path = if input_path.is_dir() {
@@ -284,7 +419,6 @@ fn run(args: Args) -> Result<()> {
             let mut ds = plexos2duckdb::SolutionDataset::default()
                 .with_model_name(model_name.to_string())
                 .with_zip_file_with_progress(&actual_input_path, &mut report)?;
-            // Look for a log file with the correct model name pattern
             let log_path = actual_input_path
                 .parent()
                 .ok_or_else(|| eyre!("Could not determine parent directory for input file"))?
@@ -387,10 +521,19 @@ fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    color_eyre::install()?;
-    let args = Args::parse();
-    run(args)
+fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Command::Convert(args) => convert(args),
+        Command::Inspect(args) => inspect_database(args),
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if let Err(err) = run(cli) {
+        eprintln!("{} {}", "Error:".red().bold(), err);
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -410,14 +553,17 @@ mod tests {
         let err = resolve_output_path(&input_path, Some(output_path.clone()), false).unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!("Output file already exists: {}. Re-run with --force to overwrite it", output_path.display())
+            format!(
+                "Output file already exists: \"{}\". Re-run with `--force` to overwrite it",
+                output_path.display().to_string().bold()
+            )
         );
         assert!(output_path.exists(), "existing output should be left untouched without --force");
         Ok(())
     }
 
     #[test]
-    fn resolve_output_path_allows_existing_file_with_force() -> Result<()> {
+    fn resolve_output_path_deletes_existing_file_with_force() -> Result<()> {
         let temp_dir = tempfile::TempDir::new()?;
         let input_path = temp_dir.path().join("input.zip");
         std::fs::File::create(&input_path)?;
@@ -427,8 +573,99 @@ mod tests {
 
         let resolved = resolve_output_path(&input_path, Some(output_path.clone()), true)?;
         assert_eq!(resolved, output_path);
-        assert!(output_path.exists(), "--force should authorize overwrite without pre-deleting the file");
-        assert_eq!(std::fs::read(&output_path)?, b"sentinel");
+        assert!(!output_path.exists(), "--force should delete any existing output file before conversion continues");
+        Ok(())
+    }
+
+    #[test]
+    fn load_database_metadata_reads_required_fields() -> Result<()> {
+        let con = duckdb::Connection::open_in_memory()?;
+        con.execute_batch(
+            "
+            CREATE TABLE main.plexos2duckdb (key TEXT, value TEXT);
+            INSERT INTO main.plexos2duckdb VALUES
+              ('plexos2duckdb_version', '0.1.2-test'),
+              ('plexos_file', '/tmp/input.zip'),
+              ('model_name', 'Model A');
+            ",
+        )?;
+
+        let metadata = load_database_metadata(&con)?;
+        assert_eq!(
+            metadata,
+            DatabaseMetadata {
+                database: String::new(),
+                converter_version: "0.1.2-test".to_string(),
+                source_file: "/tmp/input.zip".to_string(),
+                model_name: "Model A".to_string(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_table_inventory_reports_tables_and_views() -> Result<()> {
+        let con = duckdb::Connection::open_in_memory()?;
+        con.execute_batch(
+            "
+            CREATE SCHEMA raw;
+            CREATE SCHEMA report;
+            CREATE TABLE raw.items(id INTEGER);
+            INSERT INTO raw.items VALUES (1), (2), (3);
+            CREATE VIEW report.items_view AS SELECT * FROM raw.items;
+            ",
+        )?;
+
+        let inventory = load_table_inventory(&con)?;
+        assert!(inventory.iter().any(|row| row.schema == "raw" && row.table == "items" && row.kind == "table" && row.row_count == "3"));
+        assert!(inventory.iter().any(|row| row.schema == "report" && row.table == "items_view" && row.kind == "view" && row.row_count == "-"));
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_tables_render_with_tabled() {
+        let metadata_rows = vec![
+            MetadataRow { field: "database".to_string(), value: "/tmp/model.duckdb".to_string() },
+            MetadataRow { field: "model name".to_string(), value: "Model A".to_string() },
+        ];
+        let inventory = vec![TableInventoryRow {
+            schema: "raw".to_string(),
+            table: "items".to_string(),
+            kind: "table".to_string(),
+            row_count: "3".to_string(),
+        }];
+
+        let metadata_table = Table::new(metadata_rows).with(Style::rounded()).to_string();
+        let inventory_table = Table::new(inventory).with(Style::rounded()).to_string();
+
+        assert!(metadata_table.contains("field"));
+        assert!(metadata_table.contains("database"));
+        assert!(metadata_table.contains("/tmp/model.duckdb"));
+        assert!(inventory_table.contains("schema"));
+        assert!(inventory_table.contains("row_count"));
+        assert!(inventory_table.contains("items"));
+        assert!(inventory_table.contains("3"));
+    }
+
+    #[test]
+    fn user_facing_error_message_is_concise() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let input_path = temp_dir.path().join("input.zip");
+        let output_path = temp_dir.path().join("existing.duckdb");
+        std::fs::File::create(&input_path)?;
+        std::fs::File::create(&output_path)?;
+
+        let err = resolve_output_path(&input_path, Some(output_path.clone()), false).unwrap_err();
+        let rendered = format!("{} {}", "Error:".red().bold(), err);
+
+        assert!(rendered.contains(&format!(
+            "Output file already exists: \"{}\". Re-run with `--force` to overwrite it",
+            output_path.display().to_string().bold()
+        )));
+        assert!(rendered.contains("Error:"));
+        assert!(rendered.contains("\u{1b}["), "expected ANSI color escape sequence in rendered prefix");
+        assert!(!rendered.contains("Location:"));
+        assert!(!rendered.contains("Backtrace omitted"));
         Ok(())
     }
 }
