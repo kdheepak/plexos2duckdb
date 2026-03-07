@@ -94,6 +94,12 @@ Convert a solution zip file to a duckdb database:
 plexos2duckdb --input "Model-DayAhead-Solution.zip" --output "Model-DayAhead-Solution.duckdb"
 ```
 
+If the output database already exists, re-run with `--force` to overwrite it:
+
+```shell
+plexos2duckdb --input "Model-DayAhead-Solution.zip" --output "Model-DayAhead-Solution.duckdb" --force
+```
+
 Use any [duckdb compatible database viewer](https://duckdb.org/docs/stable/core_extensions/ui) to interactively explore the data with SQL:
 
 <img width="1728" height="775" alt="image" src="https://github.com/user-attachments/assets/ad829556-bef1-4982-b7b3-f7a62d225985" />

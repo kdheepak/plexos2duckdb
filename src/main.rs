@@ -20,6 +20,9 @@ struct Args {
     /// Path to the output DuckDB file (leave empty to use the same name as input)
     #[arg(short, long)]
     output: Option<std::path::PathBuf>,
+    /// Overwrite the output DuckDB file if it already exists
+    #[arg(long, default_value_t = false)]
+    force: bool,
     /// Print a summary of the dataset
     #[arg(long, default_value_t = false)]
     print_summary: bool,
@@ -65,12 +68,19 @@ fn resolve_input_path(input: &std::path::Path) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
-fn resolve_output_path(input: &std::path::PathBuf, output: Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+fn resolve_output_path(
+    input: &std::path::Path,
+    output: Option<std::path::PathBuf>,
+    force: bool,
+) -> Result<std::path::PathBuf> {
     let output_path = if let Some(output_path) = output { output_path } else { input.with_extension("duckdb") };
     let output_path =
         if output_path.extension().is_none() { output_path.with_extension("duckdb") } else { output_path };
-    if output_path.exists() {
-        std::fs::remove_file(&output_path)?;
+    if output_path.exists() && !force {
+        return Err(eyre!(
+            "Output file already exists: {}. Re-run with --force to overwrite it",
+            output_path.display()
+        ));
     }
     Ok(output_path)
 }
@@ -78,7 +88,7 @@ fn resolve_output_path(input: &std::path::PathBuf, output: Option<std::path::Pat
 fn run(args: Args) -> Result<()> {
     let input_path = resolve_input_path(&args.input)?;
     let input_dir = input_path.parent().ok_or_else(|| eyre!("Input path has no parent directory"))?;
-    let output_path = resolve_output_path(&input_path, args.output)?;
+    let output_path = resolve_output_path(&input_path, args.output, args.force)?;
 
     let mut mp = None;
     let mut pb = None;
@@ -381,4 +391,44 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
     run(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::*;
+
+    #[test]
+    fn resolve_output_path_rejects_existing_file_without_force() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let input_path = temp_dir.path().join("input.zip");
+        std::fs::File::create(&input_path)?;
+        let output_path = temp_dir.path().join("existing.duckdb");
+        std::fs::File::create(&output_path)?;
+
+        let err = resolve_output_path(&input_path, Some(output_path.clone()), false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Output file already exists: {}. Re-run with --force to overwrite it", output_path.display())
+        );
+        assert!(output_path.exists(), "existing output should be left untouched without --force");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_output_path_allows_existing_file_with_force() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let input_path = temp_dir.path().join("input.zip");
+        std::fs::File::create(&input_path)?;
+        let output_path = temp_dir.path().join("existing.duckdb");
+        let mut output_file = std::fs::File::create(&output_path)?;
+        output_file.write_all(b"sentinel")?;
+
+        let resolved = resolve_output_path(&input_path, Some(output_path.clone()), true)?;
+        assert_eq!(resolved, output_path);
+        assert!(output_path.exists(), "--force should authorize overwrite without pre-deleting the file");
+        assert_eq!(std::fs::read(&output_path)?, b"sentinel");
+        Ok(())
+    }
 }
