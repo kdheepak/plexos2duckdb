@@ -1,4 +1,8 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=build.rs");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=Rstrtmgr");
+    }
     // NOTE: This will output everything, and requires all features enabled.
     // NOTE: See the specific builder documentation for configuration options.
     let build = vergen_gitcl::BuildBuilder::all_build()?;

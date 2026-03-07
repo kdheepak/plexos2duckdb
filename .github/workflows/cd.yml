@@ -34,7 +34,6 @@ jobs:
       - name: Create GitHub Release
         uses: taiki-e/create-gh-release-action@v1
         with:
-          # You can add: changelog: CHANGELOG.md  (optional)
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.REF }}
 
@@ -74,6 +73,8 @@ jobs:
 
       - name: Upload rust binary to GitHub Release
         uses: taiki-e/upload-rust-binary-action@v1
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-l Rstrtmgr"
         with:
           bin: ${{ env.APP_NAME }}
           token: ${{ secrets.GITHUB_TOKEN }}
