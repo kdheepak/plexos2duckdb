@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "plexos2duckdb"
-version = "0.1.0b6"
+version = "0.1.0b7"
 description = "A command line tool to convert PLEXOS solution files to a DuckDB database."
 readme = "README.md"
 requires-python = ">=3.9"
