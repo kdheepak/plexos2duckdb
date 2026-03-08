@@ -8,3 +8,6 @@ download-test-data:
 
 test: download-test-data
     cargo test
+
+repl:
+    uv run --with ipython --with-editable . ipython

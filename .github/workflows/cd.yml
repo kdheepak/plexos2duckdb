@@ -63,6 +63,110 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.REF }}
 
+  # publish-crate:
+  #   name: Publish crate
+  #   needs: [upload-python-distributions, upload-binaries]
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ env.REF }}
+
+  #     - name: Install Rust (stable)
+  #       uses: dtolnay/rust-toolchain@stable
+
+  #     - name: Publish to crates.io
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  #       run: cargo publish --locked
+
+  publish-python:
+    name: Publish Python package
+    needs: [upload-python-distributions, upload-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@v1
+        with:
+          command: publish
+          args: --skip-existing --locked
+
+  upload-python-distributions:
+    name: Build & Upload Python distributions (${{ matrix.name }})
+    needs: [create-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            python-architecture: x64
+            sdist: true
+
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            python-architecture: arm64
+            sdist: false
+
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            python-architecture: x64
+            sdist: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.python-architecture }}
+
+      - name: Build Python distributions
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: >-
+            --release --locked --out dist ${{ matrix.sdist && '--sdist' || '' }}
+
+      - name: Upload Python distributions to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            dist/*
+
   upload-binaries:
     name: Build & Upload ${{ matrix.name }}
     needs: [create-release]

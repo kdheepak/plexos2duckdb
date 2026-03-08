@@ -9,12 +9,41 @@ This is a command line tool to convert PLEXOS solution files to a DuckDB databas
 
 ## Installation
 
-### Option 1: Download prebuilt binary
+### Option 1: Install with pip
+
+On supported platforms, you can install the command-line tool directly with pip:
+
+```shell
+pip install plexos2duckdb
+```
+
+Then verify the install:
+
+```shell
+plexos2duckdb --version
+```
+
+Note that this requires a published wheel for your platform.
+
+Basic Python usage:
+
+```python
+from plexos2duckdb import PLEXOS2DuckDB
+
+client = PLEXOS2DuckDB("Model DAY_AHEAD Solution.zip")
+output_path = client.convert()
+
+with client as db:
+    rows = db.query("SELECT COUNT(*) FROM information_schema.tables")
+```
+
+### Option 2: Download prebuilt binary
 
 Prebuilt binaries are available from the
 [GitHub Releases](https://github.com/epri-dev/plexos2duckdb/releases) page.
 
-1. Go to the [latest release](https://github.com/epri-dev/plexos2duckdb/releases/latest) page on GitHub.
+1. Go to the [latest release](https://github.com/epri-dev/plexos2duckdb/releases/latest) page on
+   GitHub.
 2. Download the appropriate binary for your operating system.
 3. Extract the archive:
 
@@ -39,7 +68,7 @@ Prebuilt binaries are available from the
 
    You will have to make sure `~/local/bin/` is in your `PATH`.
 
-### Option 2: Build from Source
+### Option 3: Build from Source
 
 If you prefer to build from source, ensure you have [Rust](https://www.rust-lang.org/tools/install)
 and [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed.
@@ -100,7 +129,8 @@ If the output database already exists, re-run with `--force` to overwrite it:
 plexos2duckdb convert --input "Model-DayAhead-Solution.zip" --output "Model-DayAhead-Solution.duckdb" --force
 ```
 
-Inspect an existing database to view converter metadata, source file info, model name, and table inventory with row counts:
+Inspect an existing database to view metadata, source file info, model name, and table inventory
+with row counts:
 
 ```shell
 plexos2duckdb inspect --input "Model-DayAhead-Solution.duckdb"
@@ -120,6 +150,8 @@ plexos2duckdb generate-shell-completions bash > ~/.local/share/bash-completion/c
 plexos2duckdb generate-shell-completions zsh > ~/.zfunc/_plexos2duckdb
 ```
 
-You may use any [duckdb compatible database viewer](https://duckdb.org/docs/stable/core_extensions/ui) to interactively explore the data with SQL:
+You may use any
+[duckdb compatible database viewer](https://duckdb.org/docs/stable/core_extensions/ui) to
+interactively explore the data with SQL:
 
 <img width="1728" height="775" alt="image" src="https://github.com/user-attachments/assets/ad829556-bef1-4982-b7b3-f7a62d225985" />

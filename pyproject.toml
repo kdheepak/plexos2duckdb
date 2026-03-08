@@ -1,0 +1,43 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "plexos2duckdb"
+version = "0.1.0b6"
+description = "A command line tool to convert PLEXOS solution files to a DuckDB database."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "BSD-3-Clause"
+authors = [
+    { name = "Dheepak Krishnamurthy", email = "1813121+kdheepak@users.noreply.github.com" }
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Utilities",
+]
+keywords = ["plexos", "duckdb", "cli", "energy"]
+dependencies = ["duckdb>=1.4.0", "rich>=13.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/epri-dev/plexos2duckdb"
+Repository = "https://github.com/epri-dev/plexos2duckdb"
+Documentation = "https://github.com/epri-dev/plexos2duckdb"
+Issues = "https://github.com/epri-dev/plexos2duckdb/issues"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "Cargo.toml"
+python-source = "python"
+strip = true
