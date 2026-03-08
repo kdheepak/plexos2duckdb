@@ -63,51 +63,25 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.REF }}
 
-  # publish-crate:
-  #   name: Publish crate
-  #   needs: [upload-python-distributions, upload-binaries]
-  #   runs-on: ubuntu-latest
-  #   permissions:
-  #     contents: read
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #       with:
-  #         ref: ${{ env.REF }}
-
-  #     - name: Install Rust (stable)
-  #       uses: dtolnay/rust-toolchain@stable
-
-  #     - name: Publish to crates.io
-  #       env:
-  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-  #       run: cargo publish --locked
-
   publish-python:
     name: Publish Python package
     needs: [upload-python-distributions, upload-binaries]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/plexos2duckdb
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Download Python distributions
+        uses: actions/download-artifact@v4
         with:
-          ref: ${{ env.REF }}
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
+          pattern: python-dist-*
+          path: dist
+          merge-multiple: true
 
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
-        with:
-          command: publish
-          args: --skip-existing --locked
+        uses: pypa/gh-action-pypi-publish@release/v1
 
   upload-python-distributions:
     name: Build & Upload Python distributions (${{ matrix.name }})
@@ -154,6 +128,8 @@ jobs:
 
       - name: Build Python distributions
         uses: PyO3/maturin-action@v1
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-l Rstrtmgr"
         with:
           command: build
           target: ${{ matrix.target }}
@@ -166,6 +142,13 @@ jobs:
           tag_name: ${{ env.TAG }}
           files: |
             dist/*
+
+      - name: Upload Python distributions as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
 
   upload-binaries:
     name: Build & Upload ${{ matrix.name }}
