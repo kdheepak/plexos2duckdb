@@ -22,8 +22,34 @@ env:
   REF: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - name: Checkout test data
+        uses: actions/checkout@v4
+        with:
+          repository: kdheepak/plexos-solution-files
+          path: tests/data/plexos-solution-files
+          fetch-depth: 1
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Run test suite
+        run: just test
+
   create-release:
     name: Create Release
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
