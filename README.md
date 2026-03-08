@@ -7,6 +7,8 @@
 
 This is a command line tool to convert PLEXOS solution files to a DuckDB database.
 
+<img width="1190" height="425" alt="image" src="https://github.com/user-attachments/assets/894d1cbb-03b5-40fd-8f1e-da41fd1b29c7" />
+
 ## Installation
 
 ### Option 1: Install with pip
