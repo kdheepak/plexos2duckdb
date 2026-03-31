@@ -1,6 +1,7 @@
 # plexos2duckdb
 
 [![Release](https://img.shields.io/github/v/release/epri-dev/plexos2duckdb)](https://github.com/epri-dev/plexos2duckdb/releases)
+[![PyPI](https://img.shields.io/pypi/v/plexos2duckdb)](https://pypi.org/project/plexos2duckdb/)
 [![License](https://img.shields.io/github/license/epri-dev/plexos2duckdb)](https://github.com/epri-dev/plexos2duckdb/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20MacOS%20%7C%20Linux-blue)]()
 [![Downloads](https://img.shields.io/github/downloads/epri-dev/plexos2duckdb/total?color=brightgreen)](https://github.com/epri-dev/plexos2duckdb/releases)
@@ -153,4 +154,3 @@ with client as db:
     # assumes output_path exists at "./Model DAY_AHEAD Solution.duckdb"
     print(db.connection.query("SELECT * FROM information_schema.tables"))
 ```
-
