@@ -41,11 +41,11 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install just
-        uses: taiki-e/install-action@just
+      - name: Install mise
+        uses: jdx/mise-action@v3
 
       - name: Run test suite
-        run: just test
+        run: mise run plexos2duckdb:test
 
   create-release:
     name: Create Release

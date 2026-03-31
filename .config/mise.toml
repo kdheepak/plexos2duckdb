@@ -1,0 +1,34 @@
+[settings]
+env_shell_expand = true
+status.show_env = true
+
+[env]
+RUST_TEST_THREADS = "1"
+
+[tools]
+rust = { version = "latest", postinstall = "mise run plexos2duckdb:ensure-rust-toolchain" }
+uv = "latest"
+"github:jgm/pandoc" = "latest"
+typst = "latest"
+
+[tasks."plexos2duckdb:download-test-data"]
+description = "Download the PLEXOS fixture repository used by tests"
+run = '''
+if [ ! -d tests/data/plexos-solution-files ]; then
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Error: git is required to download test fixtures into tests/data/plexos-solution-files" >&2
+    exit 1
+  fi
+  git clone --depth 1 https://github.com/kdheepak/plexos-solution-files tests/data/plexos-solution-files
+fi
+'''
+
+[tasks."plexos2duckdb:test"]
+description = "Run the Rust test suite"
+depends = ["plexos2duckdb:download-test-data"]
+run = "cargo test"
+
+[tasks."plexos2duckdb:repl"]
+description = "Start an IPython REPL with the package installed editable"
+interactive = true
+run = "uv run --with ipython --with-editable . ipython"
