@@ -32,3 +32,4 @@ run = "cargo test"
 description = "Start an IPython REPL with the package installed editable"
 interactive = true
 run = "uv run --with ipython --with-editable . ipython"
+
