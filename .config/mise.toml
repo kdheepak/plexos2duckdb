@@ -4,6 +4,7 @@ status.show_env = true
 
 [env]
 RUST_TEST_THREADS = "1"
+PLEXOS2DUCKDB_FORK_REPO = "kdheepak/plexos2duckdb"
 
 [tools]
 rust = { version = "latest", postinstall = "mise run plexos2duckdb:ensure-rust-toolchain" }
@@ -33,3 +34,93 @@ description = "Start an IPython REPL with the package installed editable"
 interactive = true
 run = "uv run --with ipython --with-editable . ipython"
 
+[tasks."plexos2duckdb:release-sync-fork"]
+description = "Sync the configured fork branch from upstream"
+shell = "bash -c"
+dir = "{{ config_root }}"
+usage = '''
+flag "--fork-repo <fork_repo>" env="PLEXOS2DUCKDB_FORK_REPO" help="Fork repo in OWNER/REPO format"
+flag "--upstream-repo <upstream_repo>" env="PLEXOS2DUCKDB_UPSTREAM_REPO" help="Upstream repo in OWNER/REPO format"
+flag "--branch <branch>" env="PLEXOS2DUCKDB_RELEASE_BRANCH" help="Branch to sync from upstream"
+flag "--force-sync" help="Allow gh repo sync to hard-reset the fork branch to upstream"
+'''
+run = '''
+set -euo pipefail
+cmd=(.config/mise/tasks/plexos2duckdb/release-via-fork sync-fork)
+if [[ -n "${usage_fork_repo:-}" ]]; then cmd+=(--fork-repo "$usage_fork_repo"); fi
+if [[ -n "${usage_upstream_repo:-}" ]]; then cmd+=(--upstream-repo "$usage_upstream_repo"); fi
+if [[ -n "${usage_branch:-}" ]]; then cmd+=(--branch "$usage_branch"); fi
+if [[ "${usage_force_sync:-false}" == "true" ]]; then cmd+=(--force-sync); fi
+"${cmd[@]}"
+'''
+
+[tasks."plexos2duckdb:release-build-on-fork"]
+description = "Create or reuse the fork release, dispatch the workflow, and wait for assets"
+shell = "bash -c"
+dir = "{{ config_root }}"
+usage = '''
+arg "<tag>" help="Release tag to build on the fork"
+flag "--fork-repo <fork_repo>" env="PLEXOS2DUCKDB_FORK_REPO" help="Fork repo in OWNER/REPO format"
+flag "--upstream-repo <upstream_repo>" env="PLEXOS2DUCKDB_UPSTREAM_REPO" help="Upstream repo in OWNER/REPO format"
+flag "--branch <branch>" env="PLEXOS2DUCKDB_RELEASE_BRANCH" help="Branch to sync from upstream"
+flag "--workflow <workflow>" env="PLEXOS2DUCKDB_RELEASE_WORKFLOW" help="Workflow file name to dispatch on the fork"
+flag "--workflow-ref <workflow_ref>" env="PLEXOS2DUCKDB_RELEASE_WORKFLOW_REF" help="Branch or tag containing the workflow file"
+flag "--allow-existing-fork-assets" help="Reuse an existing fork release with assets instead of dispatching again"
+flag "--force-sync" help="Allow gh repo sync to hard-reset the fork branch to upstream"
+flag "--skip-sync" help="Skip syncing the fork branch before dispatching the workflow"
+'''
+run = '''
+set -euo pipefail
+cmd=(.config/mise/tasks/plexos2duckdb/release-via-fork build-on-fork "${usage_tag?}")
+if [[ -n "${usage_fork_repo:-}" ]]; then cmd+=(--fork-repo "$usage_fork_repo"); fi
+if [[ -n "${usage_upstream_repo:-}" ]]; then cmd+=(--upstream-repo "$usage_upstream_repo"); fi
+if [[ -n "${usage_branch:-}" ]]; then cmd+=(--branch "$usage_branch"); fi
+if [[ -n "${usage_workflow:-}" ]]; then cmd+=(--workflow "$usage_workflow"); fi
+if [[ -n "${usage_workflow_ref:-}" ]]; then cmd+=(--workflow-ref "$usage_workflow_ref"); fi
+if [[ "${usage_allow_existing_fork_assets:-false}" == "true" ]]; then cmd+=(--allow-existing-fork-assets); fi
+if [[ "${usage_force_sync:-false}" == "true" ]]; then cmd+=(--force-sync); fi
+if [[ "${usage_skip_sync:-false}" == "true" ]]; then cmd+=(--skip-sync); fi
+"${cmd[@]}"
+'''
+
+[tasks."plexos2duckdb:release-download-fork-assets"]
+description = "Download release assets from the fork release"
+shell = "bash -c"
+dir = "{{ config_root }}"
+usage = '''
+arg "<tag>" help="Release tag to download from the fork"
+flag "--fork-repo <fork_repo>" env="PLEXOS2DUCKDB_FORK_REPO" help="Fork repo in OWNER/REPO format"
+flag "--download-dir <download_dir>" env="PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR" help="Directory or template for downloaded assets"
+flag "--clobber" help="Overwrite existing local asset files while downloading"
+'''
+run = '''
+set -euo pipefail
+cmd=(.config/mise/tasks/plexos2duckdb/release-via-fork download-fork-assets "${usage_tag?}")
+if [[ -n "${usage_fork_repo:-}" ]]; then cmd+=(--fork-repo "$usage_fork_repo"); fi
+if [[ -n "${usage_download_dir:-}" ]]; then cmd+=(--download-dir "$usage_download_dir"); fi
+if [[ "${usage_clobber:-false}" == "true" ]]; then cmd+=(--clobber); fi
+"${cmd[@]}"
+'''
+
+[tasks."plexos2duckdb:release-upload-upstream-assets"]
+description = "Upload downloaded release assets to the upstream release"
+shell = "bash -c"
+dir = "{{ config_root }}"
+usage = '''
+arg "<tag>" help="Release tag to upload into the upstream release"
+flag "--fork-repo <fork_repo>" env="PLEXOS2DUCKDB_FORK_REPO" help="Fork repo in OWNER/REPO format"
+flag "--upstream-repo <upstream_repo>" env="PLEXOS2DUCKDB_UPSTREAM_REPO" help="Upstream repo in OWNER/REPO format"
+flag "--branch <branch>" env="PLEXOS2DUCKDB_RELEASE_BRANCH" help="Branch to target if the upstream release must be created"
+flag "--download-dir <download_dir>" env="PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR" help="Directory or template containing downloaded assets"
+flag "--clobber" help="Replace upstream assets with the same names before re-uploading"
+'''
+run = '''
+set -euo pipefail
+cmd=(.config/mise/tasks/plexos2duckdb/release-via-fork upload-upstream-assets "${usage_tag?}")
+if [[ -n "${usage_fork_repo:-}" ]]; then cmd+=(--fork-repo "$usage_fork_repo"); fi
+if [[ -n "${usage_upstream_repo:-}" ]]; then cmd+=(--upstream-repo "$usage_upstream_repo"); fi
+if [[ -n "${usage_branch:-}" ]]; then cmd+=(--branch "$usage_branch"); fi
+if [[ -n "${usage_download_dir:-}" ]]; then cmd+=(--download-dir "$usage_download_dir"); fi
+if [[ "${usage_clobber:-false}" == "true" ]]; then cmd+=(--clobber); fi
+"${cmd[@]}"
+'''
