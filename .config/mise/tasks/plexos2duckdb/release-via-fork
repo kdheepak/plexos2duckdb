@@ -178,7 +178,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def add_repo_options(parser: argparse.ArgumentParser, *, include_tag: bool) -> None:
     if include_tag:
-        parser.add_argument("tag", help="Release tag to build and mirror, for example v0.1.0-beta.8.")
+        parser.add_argument(
+            "tag", help="Release tag to build and mirror, for example v0.1.0-beta.8."
+        )
     parser.add_argument(
         "--fork-repo",
         default=os.environ.get("PLEXOS2DUCKDB_FORK_REPO"),
@@ -189,7 +191,9 @@ def add_repo_options(parser: argparse.ArgumentParser, *, include_tag: bool) -> N
         default=os.environ.get("PLEXOS2DUCKDB_UPSTREAM_REPO") or infer_upstream_repo(),
         help="Upstream repo in OWNER/REPO format.",
     )
-    default_branch = os.environ.get("PLEXOS2DUCKDB_RELEASE_BRANCH") or infer_default_branch()
+    default_branch = (
+        os.environ.get("PLEXOS2DUCKDB_RELEASE_BRANCH") or infer_default_branch()
+    )
     parser.add_argument(
         "--branch",
         default=default_branch,
@@ -446,11 +450,15 @@ def ensure_fork_release(*, fork_repo: str, tag: str, branch: str) -> dict[str, A
     )
     release = get_release(repo=fork_repo, tag=tag)
     if release is None:
-        raise CommandError(f"expected fork release {fork_repo}@{tag} to exist after creation")
+        raise CommandError(
+            f"expected fork release {fork_repo}@{tag} to exist after creation"
+        )
     return release
 
 
-def dispatch_workflow(*, fork_repo: str, workflow: str, workflow_ref: str, tag: str) -> int:
+def dispatch_workflow(
+    *, fork_repo: str, workflow: str, workflow_ref: str, tag: str
+) -> int:
     started_at = dt.datetime.now(dt.UTC)
     result = run_command(
         [
@@ -595,7 +603,11 @@ def download_fork_assets(args: argparse.Namespace) -> None:
 
 def upload_upstream_assets(args: argparse.Namespace) -> None:
     download_dir = resolve_download_dir(args.tag, getattr(args, "download_dir", None))
-    asset_files = sorted(path for path in download_dir.iterdir() if path.is_file()) if download_dir.is_dir() else []
+    asset_files = (
+        sorted(path for path in download_dir.iterdir() if path.is_file())
+        if download_dir.is_dir()
+        else []
+    )
     if not asset_files:
         raise CommandError(
             f"no files were found in {download_dir}; run download-fork-assets first"
@@ -645,7 +657,7 @@ def ensure_upstream_release(
         target=branch,
         title=fork_release.get("name") or tag,
         notes=fork_release.get("body") or "",
-        prerelease=bool(fork_release.get("isPrerelease")),
+        prerelease=False,
     )
     release = get_release(repo=upstream_repo, tag=tag)
     if release is None:
@@ -753,9 +765,7 @@ def command_failure_message(
 
 def combine_output(result: subprocess.CompletedProcess[str]) -> str:
     return "\n".join(
-        part.strip()
-        for part in (result.stderr, result.stdout)
-        if part and part.strip()
+        part.strip() for part in (result.stderr, result.stdout) if part and part.strip()
     )
 
 
