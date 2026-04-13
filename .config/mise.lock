@@ -40,7 +40,7 @@ url = "https://github.com/jgm/pandoc/releases/download/3.9.0.2/pandoc-3.9.0.2-wi
 url_api = "https://api.github.com/repos/jgm/pandoc/releases/assets/377166311"
 
 [[tools.rust]]
-version = "1.94.0"
+version = "1.94.1"
 backend = "core:rust"
 
 [[tools.typst]]
@@ -98,6 +98,7 @@ url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-x86_64-unknow
 [tools.uv."platforms.macos-arm64"]
 checksum = "sha256:f7815f739ed5d0e4202e6292acedb8659b9ae7de663d07188d8c6cbd7f96303f"
 url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-aarch64-apple-darwin.tar.gz"
+provenance = "github-attestations"
 
 [tools.uv."platforms.macos-x64"]
 checksum = "sha256:2103670e8e949605e51926c7b953923ff6f6befbfb55aee928f5e760c9c910f8"
