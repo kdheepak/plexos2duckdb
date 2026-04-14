@@ -6,10 +6,6 @@ resolution-markers = [
     "python_full_version < '3.10'",
 ]
 
-[options]
-exclude-newer = "2026-03-24T11:03:59.81051Z"
-exclude-newer-span = "P7D"
-
 [[package]]
 name = "duckdb"
 version = "1.4.4"
