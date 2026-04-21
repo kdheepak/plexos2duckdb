@@ -40,7 +40,7 @@ url = "https://github.com/jgm/pandoc/releases/download/3.9.0.2/pandoc-3.9.0.2-wi
 url_api = "https://api.github.com/repos/jgm/pandoc/releases/assets/377166311"
 
 [[tools.rust]]
-version = "1.94.1"
+version = "1.95.0"
 backend = "core:rust"
 
 [[tools.typst]]
@@ -76,34 +76,40 @@ checksum = "sha256:51353994ac83218c3497052e89b2c432c53b9d4439cdc1b361e2ea4798ebf
 url = "https://github.com/typst/typst/releases/download/v0.14.2/typst-x86_64-pc-windows-msvc.zip"
 
 [[tools.uv]]
-version = "0.11.1"
+version = "0.11.7"
 backend = "aqua:astral-sh/uv"
 
 [tools.uv."platforms.linux-arm64"]
-checksum = "sha256:bd04ffce77ee8d77f39823c13606183581847c2f5dcd704f2ea0f15e376b1a27"
-url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-aarch64-unknown-linux-musl.tar.gz"
+checksum = "sha256:46647dc16cbb7d6700f762fdd7a67d220abe18570914732bc310adc91308d272"
+url = "https://github.com/astral-sh/uv/releases/download/0.11.7/uv-aarch64-unknown-linux-musl.tar.gz"
+provenance = "github-attestations"
 
 [tools.uv."platforms.linux-arm64-musl"]
-checksum = "sha256:bd04ffce77ee8d77f39823c13606183581847c2f5dcd704f2ea0f15e376b1a27"
-url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-aarch64-unknown-linux-musl.tar.gz"
+checksum = "sha256:46647dc16cbb7d6700f762fdd7a67d220abe18570914732bc310adc91308d272"
+url = "https://github.com/astral-sh/uv/releases/download/0.11.7/uv-aarch64-unknown-linux-musl.tar.gz"
+provenance = "github-attestations"
 
 [tools.uv."platforms.linux-x64"]
-checksum = "sha256:4e949471a95b37088a1ff1a585f69abed4d3cd3f921f50709a46b6ba62986d38"
-url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:64ddb5f1087649e3f75aa50d139aa4f36ddde728a5295a141e0fa9697bfb7b0f"
+url = "https://github.com/astral-sh/uv/releases/download/0.11.7/uv-x86_64-unknown-linux-musl.tar.gz"
+provenance = "github-attestations"
 
 [tools.uv."platforms.linux-x64-musl"]
-checksum = "sha256:4e949471a95b37088a1ff1a585f69abed4d3cd3f921f50709a46b6ba62986d38"
-url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:64ddb5f1087649e3f75aa50d139aa4f36ddde728a5295a141e0fa9697bfb7b0f"
+url = "https://github.com/astral-sh/uv/releases/download/0.11.7/uv-x86_64-unknown-linux-musl.tar.gz"
+provenance = "github-attestations"
 
 [tools.uv."platforms.macos-arm64"]
-checksum = "sha256:f7815f739ed5d0e4202e6292acedb8659b9ae7de663d07188d8c6cbd7f96303f"
-url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-aarch64-apple-darwin.tar.gz"
+checksum = "sha256:66e37d91f839e12481d7b932a1eccbfe732560f42c1cfb89faddfa2454534ba8"
+url = "https://github.com/astral-sh/uv/releases/download/0.11.7/uv-aarch64-apple-darwin.tar.gz"
 provenance = "github-attestations"
 
 [tools.uv."platforms.macos-x64"]
-checksum = "sha256:2103670e8e949605e51926c7b953923ff6f6befbfb55aee928f5e760c9c910f8"
-url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-x86_64-apple-darwin.tar.gz"
+checksum = "sha256:0a4bc8fcde4974ea3560be21772aeecab600a6f43fa6e58169f9fa7b3b71d302"
+url = "https://github.com/astral-sh/uv/releases/download/0.11.7/uv-x86_64-apple-darwin.tar.gz"
+provenance = "github-attestations"
 
 [tools.uv."platforms.windows-x64"]
-checksum = "sha256:6659250cebbd3bb6ee48bcb21a3f0c6656450d63fb97f0f069bcb532bdb688ed"
-url = "https://github.com/astral-sh/uv/releases/download/0.11.1/uv-x86_64-pc-windows-msvc.zip"
+checksum = "sha256:fe0c7815acf4fc45f8a5eff58ed3cf7ae2e15c3cf1dceadbd10c816ec1690cc1"
+url = "https://github.com/astral-sh/uv/releases/download/0.11.7/uv-x86_64-pc-windows-msvc.zip"
+provenance = "github-attestations"
