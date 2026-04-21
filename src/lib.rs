@@ -2,6 +2,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::io::Read as _;
+use std::sync::Arc;
 
 use color_eyre::{Result, eyre::eyre};
 use roxmltree::{Document, Node};
@@ -326,6 +327,51 @@ struct MemoObject {
     object_id: i64,
 }
 
+#[derive(Debug)]
+struct ZipPeriodData {
+    archive_file: Arc<std::fs::File>,
+    data_start: u64,
+    data_len: u64,
+}
+
+impl ZipPeriodData {
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let read_len = u64::try_from(buf.len())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "buffer length does not fit in u64"))?;
+        let end_offset = offset.checked_add(read_len).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "period data read offset overflow")
+        })?;
+
+        if end_offset > self.data_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "period data read exceeds ZIP entry bounds",
+            ));
+        }
+
+        let archive_offset = self.data_start.checked_add(offset).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "archive read offset overflow")
+        })?;
+
+        SolutionDataset::read_exact_at(&self.archive_file, archive_offset, buf)
+    }
+}
+
+#[derive(Debug)]
+enum PeriodData {
+    File(std::fs::File),
+    ZipEntry(ZipPeriodData),
+}
+
+impl PeriodData {
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            Self::File(file) => SolutionDataset::read_exact_at(file, offset, buf),
+            Self::ZipEntry(entry) => entry.read_exact_at(offset, buf),
+        }
+    }
+}
+
 /// Container for all PLEXOS solution data
 #[derive(Debug, Default)]
 pub struct SolutionDataset {
@@ -353,8 +399,7 @@ pub struct SolutionDataset {
     unit: indexmap::IndexMap<i64, Unit>,
     memo_object: Vec<MemoObject>,
     custom_column: indexmap::IndexMap<i64, CustomColumn>,
-    period_data: indexmap::IndexMap<i64, std::fs::File>,
-    temp_dir: Option<tempfile::TempDir>,
+    period_data: indexmap::IndexMap<i64, PeriodData>,
     simulation_log: Option<String>,
     run_stats: Option<String>,
     // calculated fields
@@ -527,7 +572,7 @@ impl SolutionDataset {
     }
 
     pub fn with_period_data(mut self, period_data: indexmap::IndexMap<i64, std::fs::File>) -> Self {
-        self.period_data = period_data;
+        self.period_data = period_data.into_iter().map(|(k, v)| (k, PeriodData::File(v))).collect();
         self
     }
 
@@ -578,13 +623,13 @@ impl SolutionDataset {
         path: &std::path::Path,
         model_name: &str,
         report: &mut Option<&mut dyn FnMut(&str)>,
-    ) -> Result<(String, tempfile::TempDir, indexmap::IndexMap<i64, std::fs::File>)> {
+    ) -> Result<(String, indexmap::IndexMap<i64, PeriodData>)> {
         Self::report_progress(report, "Opening ZIP archive");
-        let file = std::fs::File::open(path)?;
+        let archive_file = Arc::new(std::fs::File::open(path)?);
 
         let zip_stem = path.file_stem().ok_or_else(|| eyre!("Invalid zip file name"))?.to_string_lossy().to_string();
 
-        let mut archive = zip::ZipArchive::new(file)?;
+        let mut archive = zip::ZipArchive::new(archive_file.try_clone()?)?;
 
         Self::report_progress(report, "Selecting XML inside ZIP archive");
         let mut xml_content = String::new();
@@ -645,29 +690,27 @@ impl SolutionDataset {
         file.read_to_string(&mut xml_content)?;
         drop(file);
 
-        Self::report_progress(report, "Extracting BIN files");
-        let temp_dir = tempfile::TempDir::new()?;
+        Self::report_progress(report, "Indexing BIN files");
         let mut period_data = indexmap::IndexMap::new();
 
         let archive_len = archive.len();
         for i in 0..archive_len {
-            let mut file = archive.by_index(i)?;
+            let file = archive.by_index(i)?;
             let name = file.name().to_string();
 
             if let Some(digit) = Self::is_valid_bin_filename(&name) {
-                let safe_filename = format!("t_data_{}.BIN", digit);
-                let temp_file_path = temp_dir.path().join(&safe_filename);
+                if file.compression() != zip::CompressionMethod::Stored {
+                    return Err(eyre!("BIN file '{}' is compressed; direct ZIP reads require stored entries", name));
+                }
 
-                let mut out_file = std::fs::File::create(&temp_file_path)?;
-                std::io::copy(&mut file, &mut out_file)?;
-                drop(out_file);
-
-                let file = std::fs::File::open(&temp_file_path)?;
-                period_data.insert(digit, file);
+                let data_start =
+                    file.data_start().ok_or_else(|| eyre!("ZIP entry '{}' is missing a data start offset", name))?;
+                let entry = ZipPeriodData { archive_file: archive_file.clone(), data_start, data_len: file.size() };
+                period_data.insert(digit, PeriodData::ZipEntry(entry));
             }
         }
 
-        Ok((xml_content, temp_dir, period_data))
+        Ok((xml_content, period_data))
     }
 
     fn with_zip_file_impl<P: AsRef<std::path::Path>>(
@@ -676,10 +719,10 @@ impl SolutionDataset {
         mut report: Option<&mut dyn FnMut(&str)>,
     ) -> Result<Self> {
         let path = path.as_ref();
-        let (xml_content, temp_dir, period_data) = Self::read_zip_archive(path, &self.model_name, &mut report)?;
+        let (xml_content, period_data) = Self::read_zip_archive(path, &self.model_name, &mut report)?;
         Self::report_progress(&mut report, "Parsing XML");
-        let mut ds = self.with_file(path).with_xml_string_impl(&xml_content, report)?.with_period_data(period_data);
-        ds.temp_dir = Some(temp_dir);
+        let mut ds = self.with_file(path).with_xml_string_impl(&xml_content, report)?;
+        ds.period_data = period_data;
         Ok(ds)
     }
 
@@ -1814,7 +1857,7 @@ impl SolutionDataset {
             let ki = self.key_index(key_id)?;
             let key = self.key(key_id)?;
 
-            let file = self
+            let period_data = self
                 .period_data
                 .get(&ki.period_type_id)
                 .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
@@ -1838,7 +1881,7 @@ impl SolutionDataset {
                     .checked_add(offset_delta)
                     .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
 
-                Self::read_exact_at(file, chunk_offset, &mut chunk_buf[..chunk_bytes]).map_err(|err| {
+                period_data.read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes]).map_err(|err| {
                     eyre!("Failed reading period data for key_id {} at byte offset {}: {}", key_id, chunk_offset, err)
                 })?;
 
