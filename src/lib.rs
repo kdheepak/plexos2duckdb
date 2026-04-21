@@ -574,33 +574,28 @@ impl SolutionDataset {
         self.with_zip_file_impl(path, Some(report))
     }
 
-    fn with_zip_file_impl<P: AsRef<std::path::Path>>(
-        self,
-        path: P,
-        mut report: Option<&mut dyn FnMut(&str)>,
-    ) -> Result<Self> {
-        Self::report_progress(&mut report, "Opening ZIP archive");
-        let file = std::fs::File::open(&path)?;
+    fn read_zip_archive(
+        path: &std::path::Path,
+        model_name: &str,
+        report: &mut Option<&mut dyn FnMut(&str)>,
+    ) -> Result<(String, tempfile::TempDir, indexmap::IndexMap<i64, std::fs::File>)> {
+        Self::report_progress(report, "Opening ZIP archive");
+        let file = std::fs::File::open(path)?;
 
-        // Get the zip file's stem (base name without extension)
-        let zip_stem =
-            path.as_ref().file_stem().ok_or_else(|| eyre!("Invalid zip file name"))?.to_string_lossy().to_string();
+        let zip_stem = path.file_stem().ok_or_else(|| eyre!("Invalid zip file name"))?.to_string_lossy().to_string();
 
         let mut archive = zip::ZipArchive::new(file)?;
 
-        // Find the preferred XML file in the archive
-        Self::report_progress(&mut report, "Selecting XML inside ZIP archive");
+        Self::report_progress(report, "Selecting XML inside ZIP archive");
         let mut xml_content = String::new();
         let mut preferred_xml_index = None;
         let mut model_name_xml_index = None;
         let mut first_xml_index = None;
 
-        // Use the model name from self.model_name if available, otherwise infer from file name
-        let model_name = if !self.model_name.is_empty() {
-            Some(self.model_name.to_lowercase())
+        let model_name = if !model_name.is_empty() {
+            Some(model_name.to_lowercase())
         } else {
-            // Infer model name from file name
-            let file_name = path.as_ref().file_name().and_then(|s| s.to_str()).unwrap_or_default();
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
             Some(file_name.trim_start_matches("Model ").trim_end_matches(" Solution.zip").to_lowercase())
         };
 
@@ -645,13 +640,12 @@ impl SolutionDataset {
             return Err(eyre!("No XML file found in the zip archive"));
         };
 
-        Self::report_progress(&mut report, "Reading XML from ZIP archive");
+        Self::report_progress(report, "Reading XML from ZIP archive");
         let mut file = archive.by_index(xml_index_to_use)?;
         file.read_to_string(&mut xml_content)?;
         drop(file);
 
-        // Prepare a temporary directory to extract BIN files
-        Self::report_progress(&mut report, "Extracting BIN files");
+        Self::report_progress(report, "Extracting BIN files");
         let temp_dir = tempfile::TempDir::new()?;
         let mut period_data = indexmap::IndexMap::new();
 
@@ -660,23 +654,29 @@ impl SolutionDataset {
             let mut file = archive.by_index(i)?;
             let name = file.name().to_string();
 
-            // Use the validation function to check filename and extract digit
             if let Some(digit) = Self::is_valid_bin_filename(&name) {
-                // Extract file to temp dir with a safe filename
                 let safe_filename = format!("t_data_{}.BIN", digit);
                 let temp_file_path = temp_dir.path().join(&safe_filename);
 
                 let mut out_file = std::fs::File::create(&temp_file_path)?;
                 std::io::copy(&mut file, &mut out_file)?;
-                // Ensure data is flushed to disk
                 drop(out_file);
 
-                // Open the extracted file for streaming reads
                 let file = std::fs::File::open(&temp_file_path)?;
                 period_data.insert(digit, file);
             }
         }
 
+        Ok((xml_content, temp_dir, period_data))
+    }
+
+    fn with_zip_file_impl<P: AsRef<std::path::Path>>(
+        self,
+        path: P,
+        mut report: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let (xml_content, temp_dir, period_data) = Self::read_zip_archive(path, &self.model_name, &mut report)?;
         Self::report_progress(&mut report, "Parsing XML");
         let mut ds = self.with_file(path).with_xml_string_impl(&xml_content, report)?.with_period_data(period_data);
         ds.temp_dir = Some(temp_dir);
