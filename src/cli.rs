@@ -114,15 +114,44 @@ struct ConvertJsonEnvelope {
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum ConvertJsonEvent {
-    Status { message: String },
-    DataTableStart { index: usize, total: usize, table_name: String, keys: usize },
+    Status {
+        message: String,
+    },
+    DataTableStart {
+        index: usize,
+        total: usize,
+        table_name: String,
+        keys: usize,
+    },
     DataTableEnd,
-    DataWorkerTableStart { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
-    DataWorkerTableEnd { worker_id: usize, index: usize, total: usize },
-    DataMergeTableStart { index: usize, total: usize, table_name: String },
-    DataMergeTableEnd { index: usize, total: usize },
-    Summary { input: String, model_name: String },
-    Completed { output: String },
+    DataWorkerTableStart {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+        table_name: String,
+        keys: usize,
+    },
+    DataWorkerTableEnd {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+    },
+    DataMergeTableStart {
+        index: usize,
+        total: usize,
+        table_name: String,
+    },
+    DataMergeTableEnd {
+        index: usize,
+        total: usize,
+    },
+    Summary {
+        input: String,
+        model_name: String,
+    },
+    Completed {
+        output: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -145,7 +174,10 @@ fn print_convert_json_event(event: ConvertJsonEvent) -> Result<()> {
 
 fn resolve_input_path(input: &std::path::Path) -> Result<std::path::PathBuf> {
     let path = if input.is_file() {
-        let ext = input.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        let ext = input
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
 
         match ext.as_deref() {
             Some("zip") | Some("xml") => input.to_path_buf(),
@@ -155,7 +187,10 @@ fn resolve_input_path(input: &std::path::Path) -> Result<std::path::PathBuf> {
         let mut zip_files = std::fs::read_dir(input)?
             .filter_map(Result::ok)
             .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("zip")))
+            .filter(|p| {
+                p.extension()
+                    .map_or(false, |ext| ext.eq_ignore_ascii_case("zip"))
+            })
             .collect::<Vec<_>>();
 
         if zip_files.len() == 1 {
@@ -166,10 +201,16 @@ fn resolve_input_path(input: &std::path::Path) -> Result<std::path::PathBuf> {
             return Err(eyre!("Multiple .zip files found in directory"));
         }
     } else {
-        return Err(eyre!("Path is neither a file nor a directory: {}", input.display()));
+        return Err(eyre!(
+            "Path is neither a file nor a directory: {}",
+            input.display()
+        ));
     };
     if !path.exists() {
-        return Err(eyre!("File or directory does not exist: {}", input.display()));
+        return Err(eyre!(
+            "File or directory does not exist: {}",
+            input.display()
+        ));
     }
     Ok(path)
 }
@@ -179,9 +220,16 @@ fn resolve_output_path(
     output: Option<std::path::PathBuf>,
     force: bool,
 ) -> Result<std::path::PathBuf> {
-    let output_path = if let Some(output_path) = output { output_path } else { input.with_extension("duckdb") };
-    let output_path =
-        if output_path.extension().is_none() { output_path.with_extension("duckdb") } else { output_path };
+    let output_path = if let Some(output_path) = output {
+        output_path
+    } else {
+        input.with_extension("duckdb")
+    };
+    let output_path = if output_path.extension().is_none() {
+        output_path.with_extension("duckdb")
+    } else {
+        output_path
+    };
     if output_path.exists() {
         if !force {
             return Err(eyre!(
@@ -198,13 +246,24 @@ fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn metadata_value(metadata: &std::collections::HashMap<String, String>, key: &str) -> Result<String> {
-    metadata.get(key).cloned().ok_or_else(|| eyre!("Missing metadata key in main.plexos2duckdb: {key}"))
+fn metadata_value(
+    metadata: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Result<String> {
+    metadata
+        .get(key)
+        .cloned()
+        .ok_or_else(|| eyre!("Missing metadata key in main.plexos2duckdb: {key}"))
 }
 
 fn load_database_metadata(con: &duckdb::Connection) -> Result<DatabaseMetadata> {
     let mut stmt = con.prepare("SELECT key, value FROM main.plexos2duckdb")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?.unwrap_or_default())))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        ))
+    })?;
 
     let mut metadata = std::collections::HashMap::new();
     for row in rows {
@@ -240,7 +299,12 @@ fn load_table_inventory(con: &duckdb::Connection) -> Result<Vec<TableInventoryRo
     let mut inventory = Vec::new();
     for table in tables {
         let (schema, table_name, table_type) = table?;
-        let kind = if table_type == "BASE TABLE" { "table" } else { "view" }.to_string();
+        let kind = if table_type == "BASE TABLE" {
+            "table"
+        } else {
+            "view"
+        }
+        .to_string();
         let row_count = if table_type == "BASE TABLE" {
             let sql = format!(
                 "SELECT COUNT(*) FROM {}.{}",
@@ -252,7 +316,12 @@ fn load_table_inventory(con: &duckdb::Connection) -> Result<Vec<TableInventoryRo
         } else {
             "-".to_string()
         };
-        inventory.push(TableInventoryRow { schema, table: table_name, kind, row_count });
+        inventory.push(TableInventoryRow {
+            schema,
+            table: table_name,
+            kind,
+            row_count,
+        });
     }
 
     Ok(inventory)
@@ -260,7 +329,10 @@ fn load_table_inventory(con: &duckdb::Connection) -> Result<Vec<TableInventoryRo
 
 fn inspect_database(args: InspectArgs) -> Result<()> {
     if !args.input.exists() {
-        return Err(eyre!("DuckDB file does not exist: {}", args.input.display()));
+        return Err(eyre!(
+            "DuckDB file does not exist: {}",
+            args.input.display()
+        ));
     }
     let con = duckdb::Connection::open(&args.input)?;
     let mut metadata = load_database_metadata(&con)?;
@@ -268,14 +340,29 @@ fn inspect_database(args: InspectArgs) -> Result<()> {
     let inventory = load_table_inventory(&con)?;
 
     if args.format_diagnostics == OutputFormat::Json {
-        return print_json(&InspectJsonOutput { metadata, inventory });
+        return print_json(&InspectJsonOutput {
+            metadata,
+            inventory,
+        });
     }
 
     let metadata_rows = vec![
-        MetadataRow { field: "database".to_string(), value: metadata.database },
-        MetadataRow { field: "converter version".to_string(), value: metadata.converter_version },
-        MetadataRow { field: "source file".to_string(), value: metadata.source_file },
-        MetadataRow { field: "model name".to_string(), value: metadata.model_name },
+        MetadataRow {
+            field: "database".to_string(),
+            value: metadata.database,
+        },
+        MetadataRow {
+            field: "converter version".to_string(),
+            value: metadata.converter_version,
+        },
+        MetadataRow {
+            field: "source file".to_string(),
+            value: metadata.source_file,
+        },
+        MetadataRow {
+            field: "model name".to_string(),
+            value: metadata.model_name,
+        },
     ];
 
     println!("Metadata");
@@ -289,14 +376,17 @@ fn inspect_database(args: InspectArgs) -> Result<()> {
 fn convert(args: ConvertArgs) -> Result<()> {
     let json_mode = args.format_diagnostics == OutputFormat::Json;
     let input_path = resolve_input_path(&args.input)?;
-    let input_dir = input_path.parent().ok_or_else(|| eyre!("Input path has no parent directory"))?;
+    let input_dir = input_path
+        .parent()
+        .ok_or_else(|| eyre!("Input path has no parent directory"))?;
     let output_path = resolve_output_path(&input_path, args.output, args.force)?;
 
     let mut mp = None;
     let mut pb = None;
     let mut data_tables_pb = None;
     let mut data_merge_pb = None;
-    let mut worker_tables_pb: std::collections::BTreeMap<usize, ProgressBar> = std::collections::BTreeMap::new();
+    let mut worker_tables_pb: std::collections::BTreeMap<usize, ProgressBar> =
+        std::collections::BTreeMap::new();
     let mut current_table = None;
     let mut last_data_table_was_final = false;
     let mut last_msg = String::new();
@@ -310,7 +400,9 @@ fn convert(args: ConvertArgs) -> Result<()> {
         let multi = MultiProgress::new();
         multi.set_draw_target(ProgressDrawTarget::term(term_handle.clone(), 120));
         let spinner = multi.add(ProgressBar::new_spinner());
-        spinner.set_style(ProgressStyle::with_template("{spinner:.green} {elapsed_precise:.dim} {msg}").unwrap());
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.green} {elapsed_precise:.dim} {msg}").unwrap(),
+        );
         spinner.enable_steady_tick(Duration::from_millis(120));
         start_time = Some(Instant::now());
         last_mark = start_time;
@@ -336,7 +428,9 @@ fn convert(args: ConvertArgs) -> Result<()> {
     let _cursor_guard = CursorGuard(term.clone());
     let mut report = |msg: &str| {
         if json_mode {
-            let _ = print_convert_json_event(ConvertJsonEvent::Status { message: msg.to_string() });
+            let _ = print_convert_json_event(ConvertJsonEvent::Status {
+                message: msg.to_string(),
+            });
             return;
         }
         if let Some(spinner) = pb.as_ref() {
@@ -344,7 +438,9 @@ fn convert(args: ConvertArgs) -> Result<()> {
                 let now = Instant::now();
                 if !last_msg.is_empty() {
                     let delta = last_mark.map(|s| now.duration_since(s)).unwrap_or_default();
-                    let line = format!("[+{:>6.2}s]", delta.as_secs_f64()).dimmed().to_string();
+                    let line = format!("[+{:>6.2}s]", delta.as_secs_f64())
+                        .dimmed()
+                        .to_string();
                     let msg = last_msg.cyan().to_string();
                     spinner.println(format!("{line} {msg}"));
                 }
@@ -363,18 +459,48 @@ fn convert(args: ConvertArgs) -> Result<()> {
     let mut report_data = |event: plexos2duckdb::ProgressEvent| {
         if json_mode {
             let json_event = match event {
-                plexos2duckdb::ProgressEvent::DataTableStart { index, total, table_name, keys } => {
-                    ConvertJsonEvent::DataTableStart { index, total, table_name, keys }
+                plexos2duckdb::ProgressEvent::DataTableStart {
+                    index,
+                    total,
+                    table_name,
+                    keys,
+                } => ConvertJsonEvent::DataTableStart {
+                    index,
+                    total,
+                    table_name,
+                    keys,
                 },
                 plexos2duckdb::ProgressEvent::DataTableEnd => ConvertJsonEvent::DataTableEnd,
-                plexos2duckdb::ProgressEvent::DataWorkerTableStart { worker_id, index, total, table_name, keys } => {
-                    ConvertJsonEvent::DataWorkerTableStart { worker_id, index, total, table_name, keys }
+                plexos2duckdb::ProgressEvent::DataWorkerTableStart {
+                    worker_id,
+                    index,
+                    total,
+                    table_name,
+                    keys,
+                } => ConvertJsonEvent::DataWorkerTableStart {
+                    worker_id,
+                    index,
+                    total,
+                    table_name,
+                    keys,
                 },
-                plexos2duckdb::ProgressEvent::DataWorkerTableEnd { worker_id, index, total } => {
-                    ConvertJsonEvent::DataWorkerTableEnd { worker_id, index, total }
+                plexos2duckdb::ProgressEvent::DataWorkerTableEnd {
+                    worker_id,
+                    index,
+                    total,
+                } => ConvertJsonEvent::DataWorkerTableEnd {
+                    worker_id,
+                    index,
+                    total,
                 },
-                plexos2duckdb::ProgressEvent::DataMergeTableStart { index, total, table_name } => {
-                    ConvertJsonEvent::DataMergeTableStart { index, total, table_name }
+                plexos2duckdb::ProgressEvent::DataMergeTableStart {
+                    index,
+                    total,
+                    table_name,
+                } => ConvertJsonEvent::DataMergeTableStart {
+                    index,
+                    total,
+                    table_name,
                 },
                 plexos2duckdb::ProgressEvent::DataMergeTableEnd { index, total } => {
                     ConvertJsonEvent::DataMergeTableEnd { index, total }
@@ -387,7 +513,12 @@ fn convert(args: ConvertArgs) -> Result<()> {
             return;
         }
         match event {
-            plexos2duckdb::ProgressEvent::DataTableStart { index, total, table_name, keys } => {
+            plexos2duckdb::ProgressEvent::DataTableStart {
+                index,
+                total,
+                table_name,
+                keys,
+            } => {
                 if keys == 0 {
                     return;
                 }
@@ -421,7 +552,13 @@ fn convert(args: ConvertArgs) -> Result<()> {
                     }
                 }
             },
-            plexos2duckdb::ProgressEvent::DataWorkerTableStart { worker_id, index, total, table_name, keys } => {
+            plexos2duckdb::ProgressEvent::DataWorkerTableStart {
+                worker_id,
+                index,
+                total,
+                table_name,
+                keys,
+            } => {
                 if !worker_tables_pb.contains_key(&worker_id) {
                     if let Some(multi) = mp.as_ref() {
                         let bar = multi.add(ProgressBar::new(total as u64));
@@ -441,7 +578,11 @@ fn convert(args: ConvertArgs) -> Result<()> {
                     bar.set_message(format!("{table_name} ({keys} keys)"));
                 }
             },
-            plexos2duckdb::ProgressEvent::DataWorkerTableEnd { worker_id, index, total } => {
+            plexos2duckdb::ProgressEvent::DataWorkerTableEnd {
+                worker_id,
+                index,
+                total,
+            } => {
                 if let Some(bar) = worker_tables_pb.get(&worker_id) {
                     bar.set_length(total as u64);
                     bar.set_position(index as u64);
@@ -450,7 +591,11 @@ fn convert(args: ConvertArgs) -> Result<()> {
                     }
                 }
             },
-            plexos2duckdb::ProgressEvent::DataMergeTableStart { index, total, table_name } => {
+            plexos2duckdb::ProgressEvent::DataMergeTableStart {
+                index,
+                total,
+                table_name,
+            } => {
                 if data_merge_pb.is_none() {
                     if let Some(multi) = mp.as_ref() {
                         let bar = multi.add(ProgressBar::new(total as u64));
@@ -482,8 +627,11 @@ fn convert(args: ConvertArgs) -> Result<()> {
         }
     };
 
-    let file_name =
-        input_path.file_name().context("File name must exist")?.to_str().context("File name must be valid UTF-8")?;
+    let file_name = input_path
+        .file_name()
+        .context("File name must exist")?
+        .to_str()
+        .context("File name must be valid UTF-8")?;
     let model_name = file_name
         .trim_start_matches("Model ")
         .trim_end_matches(" Solution")
@@ -495,7 +643,10 @@ fn convert(args: ConvertArgs) -> Result<()> {
             let mut zip_files = std::fs::read_dir(&input_path)?
                 .filter_map(Result::ok)
                 .map(|e| e.path())
-                .filter(|p| p.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("zip")))
+                .filter(|p| {
+                    p.extension()
+                        .map_or(false, |ext| ext.eq_ignore_ascii_case("zip"))
+                })
                 .collect::<Vec<_>>();
             if zip_files.len() == 1 {
                 zip_files.remove(0)
@@ -507,7 +658,10 @@ fn convert(args: ConvertArgs) -> Result<()> {
         } else {
             input_path.clone()
         };
-        if actual_input_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("zip")) {
+        if actual_input_path
+            .extension()
+            .map_or(false, |ext| ext.eq_ignore_ascii_case("zip"))
+        {
             let mut ds = plexos2duckdb::SolutionDataset::default()
                 .with_model_name(model_name.to_string())
                 .with_zip_file_with_progress(&actual_input_path, &mut report)?;
@@ -521,7 +675,10 @@ fn convert(args: ConvertArgs) -> Result<()> {
                 ds = ds.with_simulation_log(log);
             }
             ds
-        } else if actual_input_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("xml")) {
+        } else if actual_input_path
+            .extension()
+            .map_or(false, |ext| ext.eq_ignore_ascii_case("xml"))
+        {
             let mut ds = plexos2duckdb::SolutionDataset::default()
                 .with_model_name(model_name.to_string())
                 .with_xml_file_with_progress(&actual_input_path, &mut report)?;
@@ -556,7 +713,9 @@ fn convert(args: ConvertArgs) -> Result<()> {
             if !last_msg.is_empty() {
                 let now = Instant::now();
                 let delta = last_mark.map(|s| now.duration_since(s)).unwrap_or_default();
-                let line = format!("[+{:>6.2}s]", delta.as_secs_f64()).dimmed().to_string();
+                let line = format!("[+{:>6.2}s]", delta.as_secs_f64())
+                    .dimmed()
+                    .to_string();
                 let msg = last_msg.cyan().to_string();
                 spinner.println(format!("{line} {msg}"));
             }
@@ -582,27 +741,36 @@ fn convert(args: ConvertArgs) -> Result<()> {
     }
 
     report("Creating DuckDB database");
-    let mode =
-        if args.in_memory { plexos2duckdb::DbWriteMode::InMemoryThenCopy } else { plexos2duckdb::DbWriteMode::Direct };
+    let mode = if args.in_memory {
+        plexos2duckdb::DbWriteMode::InMemoryThenCopy
+    } else {
+        plexos2duckdb::DbWriteMode::Direct
+    };
     let mut builder = dataset.to_duckdb(&output_path).with_mode(mode);
     if let Some(threads) = args.n_threads {
         builder = builder.with_data_write_threads(threads.get());
     }
     let builder = if json_mode || !args.no_progress_bar {
-        builder.with_progress(&mut report).with_events(&mut report_data)
+        builder
+            .with_progress(&mut report)
+            .with_events(&mut report_data)
     } else {
         builder
     };
     builder.run()?;
     if json_mode {
-        print_convert_json_event(ConvertJsonEvent::Completed { output: output_path.display().to_string() })?;
+        print_convert_json_event(ConvertJsonEvent::Completed {
+            output: output_path.display().to_string(),
+        })?;
         return Ok(());
     }
     if let Some(spinner) = pb.as_ref() {
         if !last_msg.is_empty() {
             let now = Instant::now();
             let delta = last_mark.map(|s| now.duration_since(s)).unwrap_or_default();
-            let line = format!("[+{:>6.2}s]", delta.as_secs_f64()).dimmed().to_string();
+            let line = format!("[+{:>6.2}s]", delta.as_secs_f64())
+                .dimmed()
+                .to_string();
             let msg = last_msg.cyan().to_string();
             spinner.println(format!("{line} {msg}"));
         }
@@ -623,7 +791,11 @@ fn convert(args: ConvertArgs) -> Result<()> {
     if let Some(line) = total_line.as_ref() {
         eprintln!("{}", line.green());
     }
-    println!("{} {}", "DuckDB database created at:".green(), output_path.display().to_string().blue());
+    println!(
+        "{} {}",
+        "DuckDB database created at:".green(),
+        output_path.display().to_string().blue()
+    );
     Ok(())
 }
 

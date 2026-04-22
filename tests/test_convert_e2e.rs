@@ -7,7 +7,14 @@ use std::{
 use duckdb::Connection;
 use rstest::{fixture, rstest};
 
-const EXPECTED_DATA_COLUMNS: &[&str] = &["key_id", "sample_id", "band_id", "membership_id", "block_id", "value"];
+const EXPECTED_DATA_COLUMNS: &[&str] = &[
+    "key_id",
+    "sample_id",
+    "band_id",
+    "membership_id",
+    "block_id",
+    "value",
+];
 const EXPECTED_PROCESSED_CLASSES_COLUMNS: &[&str] = &["class_id", "class", "class_group"];
 const EXPECTED_PROCESSED_MEMBERSHIPS_COLUMNS: &[&str] = &[
     "membership_id",
@@ -24,8 +31,15 @@ const EXPECTED_PROCESSED_MEMBERSHIPS_COLUMNS: &[&str] = &[
     "child_category",
     "kind",
 ];
-const EXPECTED_PROCESSED_OBJECTS_COLUMNS: &[&str] = &["id", "name", "category", "class_group", "class"];
-const EXPECTED_PROCESSED_PROPERTIES_COLUMNS: &[&str] = &["property_id", "is_summary", "collection", "property", "unit"];
+const EXPECTED_PROCESSED_OBJECTS_COLUMNS: &[&str] =
+    &["id", "name", "category", "class_group", "class"];
+const EXPECTED_PROCESSED_PROPERTIES_COLUMNS: &[&str] = &[
+    "property_id",
+    "is_summary",
+    "collection",
+    "property",
+    "unit",
+];
 const EXPECTED_TIMESTAMP_BLOCK_COLUMNS: &[&str] = &["block_id", "datetime", "interval_length"];
 const EXPECTED_REPORT_PREFIX_COLUMNS: &[&str] = &[
     "band",
@@ -77,7 +91,14 @@ const EXPECTED_RAW_TABLES: &[(&str, &[&str])] = &[
     ("models", &["model_id", "name"]),
     (
         "objects",
-        &["object_id", "class_id", "name", "category_id", "index", "is_show"],
+        &[
+            "object_id",
+            "class_id",
+            "name",
+            "category_id",
+            "index",
+            "is_show",
+        ],
     ),
     (
         "keys",
@@ -93,7 +114,16 @@ const EXPECTED_RAW_TABLES: &[(&str, &[&str])] = &[
             "timeslice_id",
         ],
     ),
-    ("key_indexes", &["key_id", "period_type_id", "position", "length", "period_offset"]),
+    (
+        "key_indexes",
+        &[
+            "key_id",
+            "period_type_id",
+            "position",
+            "length",
+            "period_offset",
+        ],
+    ),
     (
         "properties",
         &[
@@ -110,12 +140,26 @@ const EXPECTED_RAW_TABLES: &[(&str, &[&str])] = &[
         ],
     ),
     ("timeslices", &["timeslice_id", "timeslice_name"]),
-    ("samples", &["sample_id", "sample_name", "sample_phase_id", "sample_weight"]),
+    (
+        "samples",
+        &[
+            "sample_id",
+            "sample_name",
+            "sample_phase_id",
+            "sample_weight",
+        ],
+    ),
     ("units", &["unit_id", "unit_name", "lang_id"]),
     ("memo_objects", &["value", "column_id", "object_id"]),
-    ("custom_columns", &["column_id", "name", "position", "class_id"]),
+    (
+        "custom_columns",
+        &["column_id", "name", "position", "class_id"],
+    ),
     ("attribute_data", &["object_id", "attribute_id", "value"]),
-    ("attributes", &["attribute_id", "name", "lang_id", "class_id", "description"]),
+    (
+        "attributes",
+        &["attribute_id", "name", "lang_id", "class_id", "description"],
+    ),
 ];
 
 #[fixture]
@@ -129,7 +173,9 @@ fn temp_dir() -> tempfile::TempDir {
 }
 
 fn generated_output_path(temp_dir: &tempfile::TempDir, fixture_name: &str) -> PathBuf {
-    temp_dir.path().join(format!("{}.duckdb", fixture_name.replace(' ', "_")))
+    temp_dir
+        .path()
+        .join(format!("{}.duckdb", fixture_name.replace(' ', "_")))
 }
 
 fn run_convert(source_path: &Path, output_path: &Path) {
@@ -170,7 +216,12 @@ fn fetch_table_schemas(con: &Connection) -> BTreeSet<String> {
 fn fetch_metadata(con: &Connection) -> HashMap<String, String> {
     con.prepare("SELECT key, value FROM main.plexos2duckdb")
         .expect("prepare metadata query")
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?.unwrap_or_default())))
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })
         .expect("run metadata query")
         .collect::<std::result::Result<HashMap<_, _>, _>>()
         .expect("collect metadata rows")
@@ -199,7 +250,11 @@ fn fetch_column_names(con: &Connection, schema: &str, table: &str) -> Vec<String
 }
 
 fn assert_database_basics(db_path: &Path, source_path: &Path) {
-    assert!(db_path.exists(), "expected output database at {}", db_path.display());
+    assert!(
+        db_path.exists(),
+        "expected output database at {}",
+        db_path.display()
+    );
 
     let con = open_connection(db_path);
     let schemas = fetch_table_schemas(&con);
@@ -218,8 +273,14 @@ fn assert_database_basics(db_path: &Path, source_path: &Path) {
         Some(source_path.to_string_lossy().as_ref()),
         "expected metadata source path to match fixture path"
     );
-    assert!(metadata.contains_key("plexos2duckdb_version"), "missing converter version metadata");
-    assert!(metadata.contains_key("model_name"), "missing model name metadata");
+    assert!(
+        metadata.contains_key("plexos2duckdb_version"),
+        "missing converter version metadata"
+    );
+    assert!(
+        metadata.contains_key("model_name"),
+        "missing model name metadata"
+    );
 
     let data_table_count: i64 = con
         .query_row(
@@ -228,22 +289,34 @@ fn assert_database_basics(db_path: &Path, source_path: &Path) {
             |row| row.get(0),
         )
         .expect("count data tables");
-    assert!(data_table_count > 0, "expected data tables in {}", db_path.display());
+    assert!(
+        data_table_count > 0,
+        "expected data tables in {}",
+        db_path.display()
+    );
 }
 
 fn assert_columns_exact(actual: &[String], expected: &[&str], context: &str) {
-    let expected_vec = expected.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+    let expected_vec = expected
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
     assert_eq!(actual, expected_vec, "unexpected columns for {context}");
 }
 
 fn assert_report_view_shape(con: &Connection, view_name: &str, metric_name: &str) {
     let columns = fetch_column_names(con, "report", view_name);
-    let mut expected = EXPECTED_REPORT_PREFIX_COLUMNS.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+    let mut expected = EXPECTED_REPORT_PREFIX_COLUMNS
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
     expected.push(metric_name.to_string());
     expected.push("unit".to_string());
-    assert_eq!(columns, expected, "unexpected columns for report.{view_name}");
+    assert_eq!(
+        columns, expected,
+        "unexpected columns for report.{view_name}"
+    );
 }
-
 
 #[rstest]
 #[case("Model DAY_AHEAD Solution.zip")]
@@ -319,7 +392,14 @@ fn day_ahead_database_matches_detailed_schema_expectations() {
     let mut non_empty = false;
     for table in data_tables.iter().take(5) {
         let count: i64 = con
-            .query_row(&format!("SELECT COUNT(*) FROM \"data\".\"{}\"", table.replace('"', "\"\"")), [], |row| row.get(0))
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM \"data\".\"{}\"",
+                    table.replace('"', "\"\"")
+                ),
+                [],
+                |row| row.get(0),
+            )
             .expect("count rows in data table");
         if count > 0 {
             non_empty = true;
@@ -330,10 +410,16 @@ fn day_ahead_database_matches_detailed_schema_expectations() {
 
     let report_view = &report_views[0];
     let mut stmt = con
-        .prepare(&format!("SELECT * FROM \"report\".\"{}\" LIMIT 5", report_view.replace('"', "\"\"")))
+        .prepare(&format!(
+            "SELECT * FROM \"report\".\"{}\" LIMIT 5",
+            report_view.replace('"', "\"\"")
+        ))
         .expect("prepare report view query");
     let mut rows = stmt.query([]).expect("query report view");
-    assert!(rows.next().expect("read report row").is_some(), "expected report view to return at least one row");
+    assert!(
+        rows.next().expect("read report row").is_some(),
+        "expected report view to return at least one row"
+    );
 }
 
 #[test]
@@ -401,7 +487,14 @@ fn lt_solution_preserves_observed_table_shapes() {
             &format!("data.{table}"),
         );
         let count: i64 = con
-            .query_row(&format!("SELECT COUNT(*) FROM \"data\".\"{}\"", table.replace('"', "\"\"")), [], |row| row.get(0))
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM \"data\".\"{}\"",
+                    table.replace('"', "\"\"")
+                ),
+                [],
+                |row| row.get(0),
+            )
             .expect("count LT data table rows");
         assert_eq!(count, 144, "unexpected row count for data.{table}");
     }
@@ -410,7 +503,11 @@ fn lt_solution_preserves_observed_table_shapes() {
     assert_eq!(report_views.len(), 29, "unexpected LT report view count");
     assert_report_view_shape(&con, "LT__Interval__Batteries__Generation", "Generation");
     assert_report_view_shape(&con, "LT__Interval__Batteries__Load", "Load");
-    assert_report_view_shape(&con, "LT__Interval__Batteries__Net_Generation", "Net_Generation");
+    assert_report_view_shape(
+        &con,
+        "LT__Interval__Batteries__Net_Generation",
+        "Net_Generation",
+    );
 }
 
 #[test]
@@ -463,7 +560,14 @@ fn st_solution_preserves_observed_table_shapes() {
             &format!("data.{table}"),
         );
         let count: i64 = con
-            .query_row(&format!("SELECT COUNT(*) FROM \"data\".\"{}\"", table.replace('"', "\"\"")), [], |row| row.get(0))
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM \"data\".\"{}\"",
+                    table.replace('"', "\"\"")
+                ),
+                [],
+                |row| row.get(0),
+            )
             .expect("count ST data table rows");
         assert_eq!(count, 24, "unexpected row count for data.{table}");
     }
@@ -472,7 +576,11 @@ fn st_solution_preserves_observed_table_shapes() {
     assert_eq!(report_views.len(), 53, "unexpected ST report view count");
     assert_report_view_shape(&con, "ST__Interval__Batteries__Generation", "Generation");
     assert_report_view_shape(&con, "ST__Interval__Batteries__Load", "Load");
-    assert_report_view_shape(&con, "ST__Interval__Batteries__Net_Generation", "Net_Generation");
+    assert_report_view_shape(
+        &con,
+        "ST__Interval__Batteries__Net_Generation",
+        "Net_Generation",
+    );
 }
 
 #[test]
@@ -524,7 +632,14 @@ fn base_solution_preserves_observed_table_shapes() {
             &format!("data.{table}"),
         );
         let count: i64 = con
-            .query_row(&format!("SELECT COUNT(*) FROM \"data\".\"{}\"", table.replace('"', "\"\"")), [], |row| row.get(0))
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM \"data\".\"{}\"",
+                    table.replace('"', "\"\"")
+                ),
+                [],
+                |row| row.get(0),
+            )
             .expect("count base data table rows");
         assert_eq!(count, 1, "unexpected row count for data.{table}");
     }
@@ -533,5 +648,9 @@ fn base_solution_preserves_observed_table_shapes() {
     assert_eq!(report_views.len(), 43, "unexpected base report view count");
     assert_report_view_shape(&con, "ST__Day__Batteries__Generation", "Generation");
     assert_report_view_shape(&con, "ST__Day__Batteries__Load", "Load");
-    assert_report_view_shape(&con, "ST__Interval__Regions__Unserved_Energy", "Unserved_Energy");
+    assert_report_view_shape(
+        &con,
+        "ST__Interval__Regions__Unserved_Energy",
+        "Unserved_Energy",
+    );
 }

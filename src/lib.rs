@@ -308,7 +308,11 @@ impl Property {
     }
 
     fn summary_name(&self) -> String {
-        if self.is_summary { self.summary_name.clone() } else { self.name.clone() }
+        if self.is_summary {
+            self.summary_name.clone()
+        } else {
+            self.name.clone()
+        }
     }
 }
 
@@ -336,10 +340,17 @@ struct ZipPeriodData {
 
 impl ZipPeriodData {
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        let read_len = u64::try_from(buf.len())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "buffer length does not fit in u64"))?;
+        let read_len = u64::try_from(buf.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer length does not fit in u64",
+            )
+        })?;
         let end_offset = offset.checked_add(read_len).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "period data read offset overflow")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "period data read offset overflow",
+            )
         })?;
 
         if end_offset > self.data_len {
@@ -350,7 +361,10 @@ impl ZipPeriodData {
         }
 
         let archive_offset = self.data_start.checked_add(offset).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "archive read offset overflow")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive read offset overflow",
+            )
         })?;
 
         SolutionDataset::read_exact_at(&self.archive_file, archive_offset, buf)
@@ -410,12 +424,34 @@ pub struct SolutionDataset {
 
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
-    DataTableStart { index: usize, total: usize, table_name: String, keys: usize },
+    DataTableStart {
+        index: usize,
+        total: usize,
+        table_name: String,
+        keys: usize,
+    },
     DataTableEnd,
-    DataWorkerTableStart { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
-    DataWorkerTableEnd { worker_id: usize, index: usize, total: usize },
-    DataMergeTableStart { index: usize, total: usize, table_name: String },
-    DataMergeTableEnd { index: usize, total: usize },
+    DataWorkerTableStart {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+        table_name: String,
+        keys: usize,
+    },
+    DataWorkerTableEnd {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+    },
+    DataMergeTableStart {
+        index: usize,
+        total: usize,
+        table_name: String,
+    },
+    DataMergeTableEnd {
+        index: usize,
+        total: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -444,8 +480,20 @@ struct StagedDataShard {
 
 #[derive(Debug)]
 enum DataWriteWorkerEvent {
-    TableStarted { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
-    TableCompleted { worker_id: usize, index: usize, total: usize, table_name: String, keys: usize },
+    TableStarted {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+        table_name: String,
+        keys: usize,
+    },
+    TableCompleted {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+        table_name: String,
+        keys: usize,
+    },
 }
 
 pub struct DuckdbBuilder<'a> {
@@ -493,22 +541,29 @@ impl<'a> DuckdbBuilder<'a> {
         let mut report = self.report.take();
         let mut progress = self.progress.take();
         let has_callbacks = report.is_some() || progress.is_some();
-        let mut combined = |update: DuckdbProgress| {
-            match update {
-                DuckdbProgress::Report(msg) => {
-                    if let Some(report) = report.as_mut() {
-                        report(msg.as_str());
-                    }
-                },
-                DuckdbProgress::Event(event) => {
-                    if let Some(progress) = progress.as_mut() {
-                        progress(event);
-                    }
-                },
-            }
+        let mut combined = |update: DuckdbProgress| match update {
+            DuckdbProgress::Report(msg) => {
+                if let Some(report) = report.as_mut() {
+                    report(msg.as_str());
+                }
+            },
+            DuckdbProgress::Event(event) => {
+                if let Some(progress) = progress.as_mut() {
+                    progress(event);
+                }
+            },
         };
-        let combined_opt = if has_callbacks { Some(&mut combined as &mut dyn FnMut(DuckdbProgress)) } else { None };
-        self.dataset.to_duckdb_impl(&self.db_path, combined_opt, self.mode, self.data_write_threads)
+        let combined_opt = if has_callbacks {
+            Some(&mut combined as &mut dyn FnMut(DuckdbProgress))
+        } else {
+            None
+        };
+        self.dataset.to_duckdb_impl(
+            &self.db_path,
+            combined_opt,
+            self.mode,
+            self.data_write_threads,
+        )
     }
 }
 
@@ -560,7 +615,10 @@ impl SolutionDataset {
 
     /// Get all categories of a specific class
     fn get_categories_by_class(&self, class_id: i64) -> Vec<&Category> {
-        self.category.values().filter(|c| c.class_id == class_id).collect()
+        self.category
+            .values()
+            .filter(|c| c.class_id == class_id)
+            .collect()
     }
 
     pub fn with_model_name(mut self, model_name: String) -> Self {
@@ -572,7 +630,10 @@ impl SolutionDataset {
     }
 
     pub fn with_period_data(mut self, period_data: indexmap::IndexMap<i64, std::fs::File>) -> Self {
-        self.period_data = period_data.into_iter().map(|(k, v)| (k, PeriodData::File(v))).collect();
+        self.period_data = period_data
+            .into_iter()
+            .map(|(k, v)| (k, PeriodData::File(v)))
+            .collect();
         self
     }
 
@@ -604,7 +665,9 @@ impl SolutionDataset {
             static ref RE: regex::Regex = regex::Regex::new(r"^t_data_(\d+)\.BIN$").unwrap();
         }
 
-        RE.captures(name).and_then(|cap| cap.get(1)).and_then(|m| m.as_str().parse::<i64>().ok())
+        RE.captures(name)
+            .and_then(|cap| cap.get(1))
+            .and_then(|m| m.as_str().parse::<i64>().ok())
     }
 
     pub fn with_zip_file<P: AsRef<std::path::Path>>(self, path: P) -> Result<Self> {
@@ -627,7 +690,11 @@ impl SolutionDataset {
         Self::report_progress(report, "Opening ZIP archive");
         let archive_file = Arc::new(std::fs::File::open(path)?);
 
-        let zip_stem = path.file_stem().ok_or_else(|| eyre!("Invalid zip file name"))?.to_string_lossy().to_string();
+        let zip_stem = path
+            .file_stem()
+            .ok_or_else(|| eyre!("Invalid zip file name"))?
+            .to_string_lossy()
+            .to_string();
 
         let mut archive = zip::ZipArchive::new(archive_file.try_clone()?)?;
 
@@ -640,8 +707,16 @@ impl SolutionDataset {
         let model_name = if !model_name.is_empty() {
             Some(model_name.to_lowercase())
         } else {
-            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-            Some(file_name.trim_start_matches("Model ").trim_end_matches(" Solution.zip").to_lowercase())
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            Some(
+                file_name
+                    .trim_start_matches("Model ")
+                    .trim_end_matches(" Solution.zip")
+                    .to_lowercase(),
+            )
         };
 
         for i in 0..archive.len() {
@@ -649,12 +724,18 @@ impl SolutionDataset {
             let file_name = file.name().to_string();
             let file_name_lower = file_name.to_lowercase();
             if file_name_lower.ends_with(".xml") {
-                if let Some(stem) = std::path::Path::new(&file_name).file_stem().map(|s| s.to_string_lossy()) {
+                if let Some(stem) = std::path::Path::new(&file_name)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy())
+                {
                     if stem == zip_stem {
                         preferred_xml_index = Some(i);
                         break;
                     }
-                    if model_name.as_ref().map_or(false, |mn| stem.to_lowercase().contains(mn.as_str())) {
+                    if model_name
+                        .as_ref()
+                        .map_or(false, |mn| stem.to_lowercase().contains(mn.as_str()))
+                    {
                         if model_name_xml_index.is_none() {
                             model_name_xml_index = Some(i);
                         }
@@ -700,12 +781,20 @@ impl SolutionDataset {
 
             if let Some(digit) = Self::is_valid_bin_filename(&name) {
                 if file.compression() != zip::CompressionMethod::Stored {
-                    return Err(eyre!("BIN file '{}' is compressed; direct ZIP reads require stored entries", name));
+                    return Err(eyre!(
+                        "BIN file '{}' is compressed; direct ZIP reads require stored entries",
+                        name
+                    ));
                 }
 
-                let data_start =
-                    file.data_start().ok_or_else(|| eyre!("ZIP entry '{}' is missing a data start offset", name))?;
-                let entry = ZipPeriodData { archive_file: archive_file.clone(), data_start, data_len: file.size() };
+                let data_start = file
+                    .data_start()
+                    .ok_or_else(|| eyre!("ZIP entry '{}' is missing a data start offset", name))?;
+                let entry = ZipPeriodData {
+                    archive_file: archive_file.clone(),
+                    data_start,
+                    data_len: file.size(),
+                };
                 period_data.insert(digit, PeriodData::ZipEntry(entry));
             }
         }
@@ -719,9 +808,12 @@ impl SolutionDataset {
         mut report: Option<&mut dyn FnMut(&str)>,
     ) -> Result<Self> {
         let path = path.as_ref();
-        let (xml_content, period_data) = Self::read_zip_archive(path, &self.model_name, &mut report)?;
+        let (xml_content, period_data) =
+            Self::read_zip_archive(path, &self.model_name, &mut report)?;
         Self::report_progress(&mut report, "Parsing XML");
-        let mut ds = self.with_file(path).with_xml_string_impl(&xml_content, report)?;
+        let mut ds = self
+            .with_file(path)
+            .with_xml_string_impl(&xml_content, report)?;
         ds.period_data = period_data;
         Ok(ds)
     }
@@ -755,7 +847,11 @@ impl SolutionDataset {
         self.with_xml_string_impl(xml, None)
     }
 
-    fn with_xml_string_impl(mut self, xml: &str, mut report: Option<&mut dyn FnMut(&str)>) -> Result<Self> {
+    fn with_xml_string_impl(
+        mut self,
+        xml: &str,
+        mut report: Option<&mut dyn FnMut(&str)>,
+    ) -> Result<Self> {
         Self::report_progress(&mut report, "Parsing XML document");
         let doc = Document::parse(xml)?;
 
@@ -857,7 +953,15 @@ impl SolutionDataset {
             let show = get_child(&object_node, "show")?;
             let guid = get_child(&object_node, "GUID").ok();
 
-            let object = Object { class_id, name, category_id, index, object_id, show, guid };
+            let object = Object {
+                class_id,
+                name,
+                category_id,
+                index,
+                object_id,
+                show,
+                guid,
+            };
             self.object.insert(object.object_id, object);
         }
         self.object.sort_keys();
@@ -898,7 +1002,15 @@ impl SolutionDataset {
             let input_mask = get_child(&attribute_node, "input_mask").ok();
             let lang_id = get_child(&attribute_node, "lang_id")?;
 
-            let attribute = Attribute { attribute_id, class_id, enum_id, name, description, lang_id, input_mask };
+            let attribute = Attribute {
+                attribute_id,
+                class_id,
+                enum_id,
+                name,
+                description,
+                lang_id,
+                input_mask,
+            };
             self.attribute.insert(attribute.attribute_id, attribute);
         }
         self.attribute.sort_keys();
@@ -956,7 +1068,11 @@ impl SolutionDataset {
             let value = get_child(&node, "value")?;
             let lang_id = get_child(&node, "lang_id")?;
 
-            let unit = Unit { id: unit_id, value, lang_id };
+            let unit = Unit {
+                id: unit_id,
+                value,
+                lang_id,
+            };
 
             self.unit.insert(unit.id, unit);
         }
@@ -980,7 +1096,12 @@ impl SolutionDataset {
             let rank = get_child(&node, "rank")?;
             let name = get_child(&node, "name")?;
 
-            let category = Category { category_id, class_id, rank, name };
+            let category = Category {
+                category_id,
+                class_id,
+                rank,
+                name,
+            };
             self.category.insert(category.category_id, category);
         }
         self.category.sort_keys();
@@ -995,7 +1116,13 @@ impl SolutionDataset {
             let lang_id = get_child(&class_node, "lang_id")?;
             let state = get_child(&class_node, "state").ok();
 
-            let class = Class { class_id, name, class_group_id, lang_id, state };
+            let class = Class {
+                class_id,
+                name,
+                class_group_id,
+                lang_id,
+                state,
+            };
             self.class.insert(class.class_id, class);
         }
         self.class.sort_keys();
@@ -1009,8 +1136,14 @@ impl SolutionDataset {
             let lang_id = get_child(&class_group_node, "lang_id")?;
             let state = get_child(&class_group_node, "state").ok();
 
-            let class_group = ClassGroup { class_group_id, name, lang_id, state };
-            self.class_group.insert(class_group.class_group_id, class_group);
+            let class_group = ClassGroup {
+                class_group_id,
+                name,
+                lang_id,
+                state,
+            };
+            self.class_group
+                .insert(class_group.class_group_id, class_group);
         }
         self.class_group.sort_keys();
         Ok(())
@@ -1081,7 +1214,13 @@ impl SolutionDataset {
             let length = get_child(&key_index_node, "length")?;
             let period_offset = get_child(&key_index_node, "period_offset")?;
 
-            let key_index = KeyIndex { key_id, period_type_id, position, length, period_offset };
+            let key_index = KeyIndex {
+                key_id,
+                period_type_id,
+                position,
+                length,
+                period_offset,
+            };
             self.key_index.insert(key_index.key_id, key_index);
         }
         self.key_index.sort_keys();
@@ -1098,8 +1237,11 @@ impl SolutionDataset {
             let month_id = get_child(&period_node, "month_id")?;
             let fiscal_year_id = get_child(&period_node, "fiscal_year_id")?;
             let datetime: String = get_child(&period_node, "datetime")?;
-            let datetime =
-                chrono::DateTime::parse_from_str(&format!("{datetime} +0000"), "%d/%m/%Y %H:%M:%S %z")?.into();
+            let datetime = chrono::DateTime::parse_from_str(
+                &format!("{datetime} +0000"),
+                "%d/%m/%Y %H:%M:%S %z",
+            )?
+            .into();
             let period_of_day = get_child(&period_node, "period_of_day")?;
             let quarter_id = get_child(&period_node, "quarter_id").ok();
 
@@ -1119,7 +1261,10 @@ impl SolutionDataset {
                 .or_default()
                 .insert(period0.interval_id, PeriodType::Interval(period0));
         }
-        self.period.entry("interval".to_string()).or_default().sort_keys();
+        self.period
+            .entry("interval".to_string())
+            .or_default()
+            .sort_keys();
         Ok(())
     }
 
@@ -1132,11 +1277,24 @@ impl SolutionDataset {
             let month_id = get_child(&period_node, "month_id")?;
             let fiscal_year_id = get_child(&period_node, "fiscal_year_id")?;
             let quarter_id = get_child(&period_node, "quarter_id").ok();
-            let period1 = Period1 { day_id, date, week_id, month_id, fiscal_year_id, quarter_id };
+            let period1 = Period1 {
+                day_id,
+                date,
+                week_id,
+                month_id,
+                fiscal_year_id,
+                quarter_id,
+            };
 
-            self.period.entry("day".to_string()).or_default().insert(period1.day_id, PeriodType::Day(period1));
+            self.period
+                .entry("day".to_string())
+                .or_default()
+                .insert(period1.day_id, PeriodType::Day(period1));
         }
-        self.period.entry("day".to_string()).or_default().sort_keys();
+        self.period
+            .entry("day".to_string())
+            .or_default()
+            .sort_keys();
         Ok(())
     }
 
@@ -1145,10 +1303,19 @@ impl SolutionDataset {
             let week_id = get_child(&period_node, "week_id")?;
             let week_ending: String = get_child(&period_node, "week_ending")?;
             let week_ending = parse_datetime_to_utc(&week_ending)?;
-            let period2 = Period2 { week_id, week_ending };
-            self.period.entry("week".to_string()).or_default().insert(period2.week_id, PeriodType::Week(period2));
+            let period2 = Period2 {
+                week_id,
+                week_ending,
+            };
+            self.period
+                .entry("week".to_string())
+                .or_default()
+                .insert(period2.week_id, PeriodType::Week(period2));
         }
-        self.period.entry("week".to_string()).or_default().sort_keys();
+        self.period
+            .entry("week".to_string())
+            .or_default()
+            .sort_keys();
         Ok(())
     }
 
@@ -1157,10 +1324,19 @@ impl SolutionDataset {
             let month_id = get_child(&period_node, "month_id")?;
             let month_beginning: String = get_child(&period_node, "month_beginning")?;
             let month_beginning = parse_datetime_to_utc(&month_beginning)?;
-            let period3 = Period3 { month_id, month_beginning };
-            self.period.entry("month".to_string()).or_default().insert(period3.month_id, PeriodType::Month(period3));
+            let period3 = Period3 {
+                month_id,
+                month_beginning,
+            };
+            self.period
+                .entry("month".to_string())
+                .or_default()
+                .insert(period3.month_id, PeriodType::Month(period3));
         }
-        self.period.entry("month".to_string()).or_default().sort_keys();
+        self.period
+            .entry("month".to_string())
+            .or_default()
+            .sort_keys();
         Ok(())
     }
 
@@ -1169,13 +1345,19 @@ impl SolutionDataset {
             let fiscal_year_id = get_child(&period_node, "fiscal_year_id")?;
             let year_ending: String = get_child(&period_node, "year_ending")?;
             let year_ending = parse_datetime_to_utc(&year_ending)?;
-            let period4 = Period4 { fiscal_year_id, year_ending };
+            let period4 = Period4 {
+                fiscal_year_id,
+                year_ending,
+            };
             self.period
                 .entry("year".to_string())
                 .or_default()
                 .insert(period4.fiscal_year_id, PeriodType::Year(period4));
         }
-        self.period.entry("year".to_string()).or_default().sort_keys();
+        self.period
+            .entry("year".to_string())
+            .or_default()
+            .sort_keys();
         Ok(())
     }
 
@@ -1185,9 +1367,15 @@ impl SolutionDataset {
             let datetime: String = get_child(&period_node, "datetime")?;
             let datetime = parse_datetime_to_utc(&datetime)?;
             let period6 = Period6 { hour_id, datetime };
-            self.period.entry("hour".to_string()).or_default().insert(period6.hour_id, PeriodType::Hour(period6));
+            self.period
+                .entry("hour".to_string())
+                .or_default()
+                .insert(period6.hour_id, PeriodType::Hour(period6));
         }
-        self.period.entry("hour".to_string()).or_default().sort_keys();
+        self.period
+            .entry("hour".to_string())
+            .or_default()
+            .sort_keys();
         Ok(())
     }
 
@@ -1196,13 +1384,19 @@ impl SolutionDataset {
             let quarter_id = get_child(&period_node, "quarter_id")?;
             let quarter_beginning: String = get_child(&period_node, "quarter_beginning")?;
             let quarter_beginning = parse_datetime_to_utc(&quarter_beginning)?;
-            let period7 = Period7 { quarter_id, quarter_beginning };
+            let period7 = Period7 {
+                quarter_id,
+                quarter_beginning,
+            };
             self.period
                 .entry("quarter".to_string())
                 .or_default()
                 .insert(period7.quarter_id, PeriodType::Quarter(period7));
         }
-        self.period.entry("quarter".to_string()).or_default().sort_keys();
+        self.period
+            .entry("quarter".to_string())
+            .or_default()
+            .sort_keys();
         Ok(())
     }
 
@@ -1211,8 +1405,14 @@ impl SolutionDataset {
             let interval_id = get_child(&phase_node, "interval_id")?;
             let period_id = get_child(&phase_node, "period_id")?;
 
-            let phase1 = Phase1 { interval_id, period_id };
-            self.phase.entry("LT".to_string()).or_default().insert(phase1.interval_id, PhaseType::LT(phase1));
+            let phase1 = Phase1 {
+                interval_id,
+                period_id,
+            };
+            self.phase
+                .entry("LT".to_string())
+                .or_default()
+                .insert(phase1.interval_id, PhaseType::LT(phase1));
         }
         self.phase.entry("LT".to_string()).or_default().sort_keys();
         Ok(())
@@ -1223,10 +1423,19 @@ impl SolutionDataset {
             let interval_id = get_child(&phase_node, "interval_id")?;
             let period_id = get_child(&phase_node, "period_id")?;
 
-            let phase2 = Phase2 { interval_id, period_id };
-            self.phase.entry("PASA".to_string()).or_default().insert(phase2.interval_id, PhaseType::PASA(phase2));
+            let phase2 = Phase2 {
+                interval_id,
+                period_id,
+            };
+            self.phase
+                .entry("PASA".to_string())
+                .or_default()
+                .insert(phase2.interval_id, PhaseType::PASA(phase2));
         }
-        self.phase.entry("PASA".to_string()).or_default().sort_keys();
+        self.phase
+            .entry("PASA".to_string())
+            .or_default()
+            .sort_keys();
         Ok(())
     }
 
@@ -1235,8 +1444,14 @@ impl SolutionDataset {
             let interval_id = get_child(&phase_node, "interval_id")?;
             let period_id = get_child(&phase_node, "period_id")?;
 
-            let phase3 = Phase3 { interval_id, period_id };
-            self.phase.entry("MT".to_string()).or_default().insert(phase3.interval_id, PhaseType::MT(phase3));
+            let phase3 = Phase3 {
+                interval_id,
+                period_id,
+            };
+            self.phase
+                .entry("MT".to_string())
+                .or_default()
+                .insert(phase3.interval_id, PhaseType::MT(phase3));
         }
         self.phase.entry("MT".to_string()).or_default().sort_keys();
         Ok(())
@@ -1247,8 +1462,14 @@ impl SolutionDataset {
             let interval_id = get_child(&phase_node, "interval_id")?;
             let period_id = get_child(&phase_node, "period_id")?;
 
-            let phase4 = Phase4 { interval_id, period_id };
-            self.phase.entry("ST".to_string()).or_default().insert(phase4.interval_id, PhaseType::ST(phase4));
+            let phase4 = Phase4 {
+                interval_id,
+                period_id,
+            };
+            self.phase
+                .entry("ST".to_string())
+                .or_default()
+                .insert(phase4.interval_id, PhaseType::ST(phase4));
         }
         self.phase.entry("ST".to_string()).or_default().sort_keys();
         Ok(())
@@ -1259,7 +1480,10 @@ impl SolutionDataset {
             let id = get_child(&sample_node, "sample_id")?;
             let name = get_child(&sample_node, "sample_name").ok();
 
-            let sample = Sample { sample_id: id, name };
+            let sample = Sample {
+                sample_id: id,
+                name,
+            };
             self.sample.insert(sample.sample_id, sample);
         }
         self.sample.sort_keys();
@@ -1267,13 +1491,21 @@ impl SolutionDataset {
     }
 
     fn parse_sample_weight(&mut self, node: &Node) -> Result<()> {
-        for sample_weight_node in node.children().filter(|n| n.has_tag_name("t_sample_weight")) {
+        for sample_weight_node in node
+            .children()
+            .filter(|n| n.has_tag_name("t_sample_weight"))
+        {
             let sample_id = get_child(&sample_weight_node, "sample_id")?;
             let phase_id = get_child(&sample_weight_node, "phase_id")?;
             let weight = get_child(&sample_weight_node, "value")?;
 
-            let sample_weight = SampleWeight { sample_id, phase_id, weight };
-            self.sample_weight.insert(sample_weight.sample_id, sample_weight);
+            let sample_weight = SampleWeight {
+                sample_id,
+                phase_id,
+                weight,
+            };
+            self.sample_weight
+                .insert(sample_weight.sample_id, sample_weight);
         }
         self.sample_weight.sort_keys();
         Ok(())
@@ -1292,13 +1524,21 @@ impl SolutionDataset {
     }
 
     fn parse_attribute_data(&mut self, node: &Node) -> Result<()> {
-        for attribute_node in node.children().filter(|n| n.has_tag_name("t_attribute_data")) {
+        for attribute_node in node
+            .children()
+            .filter(|n| n.has_tag_name("t_attribute_data"))
+        {
             let object_id = get_child(&attribute_node, "object_id").ok();
             let attribute_id = get_child(&attribute_node, "attribute_id")?;
             let value = get_child(&attribute_node, "value")?;
 
-            let attribute_data = AttributeData { object_id, attribute_id, value };
-            self.attribute_data.insert(attribute_data.attribute_id, attribute_data);
+            let attribute_data = AttributeData {
+                object_id,
+                attribute_id,
+                value,
+            };
+            self.attribute_data
+                .insert(attribute_data.attribute_id, attribute_data);
         }
         self.attribute_data.sort_keys();
         Ok(())
@@ -1310,7 +1550,11 @@ impl SolutionDataset {
             let column_id = get_child(&memo_node, "column_id")?;
             let object_id = get_child(&memo_node, "object_id")?;
 
-            let memo_object = MemoObject { value, column_id, object_id };
+            let memo_object = MemoObject {
+                value,
+                column_id,
+                object_id,
+            };
             self.memo_object.push(memo_object);
         }
 
@@ -1318,13 +1562,22 @@ impl SolutionDataset {
     }
 
     fn parse_custom_column(&mut self, node: &Node) -> Result<()> {
-        for custom_column_node in node.children().filter(|n| n.has_tag_name("t_custom_column")) {
+        for custom_column_node in node
+            .children()
+            .filter(|n| n.has_tag_name("t_custom_column"))
+        {
             let column_id = get_child(&custom_column_node, "column_id")?;
             let name = get_child(&custom_column_node, "name")?;
             let position = get_child(&custom_column_node, "position")?;
             let class_id = get_child(&custom_column_node, "class_id")?;
-            let custom_column = CustomColumn { column_id, name, position, class_id };
-            self.custom_column.insert(custom_column.column_id, custom_column);
+            let custom_column = CustomColumn {
+                column_id,
+                name,
+                position,
+                class_id,
+            };
+            self.custom_column
+                .insert(custom_column.column_id, custom_column);
         }
         self.custom_column.sort_keys();
         Ok(())
@@ -1361,7 +1614,10 @@ impl SolutionDataset {
                     if let Ok(period) = extractor(self, interval_id) {
                         let datetime = period.datetime();
                         let key = format!("{}__{}", phase_name, period_name);
-                        self.timestamp_block.entry(key).or_default().push((datetime, period_id));
+                        self.timestamp_block
+                            .entry(key)
+                            .or_default()
+                            .push((datetime, period_id));
                     }
                 }
             }
@@ -1372,14 +1628,18 @@ impl SolutionDataset {
 
     fn update_collection_membership_count(&mut self) -> Result<()> {
         // count how many memberships per collection
-        let mut membership_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        let mut membership_counts: std::collections::HashMap<i64, usize> =
+            std::collections::HashMap::new();
 
         for membership in self.membership.values() {
-            *membership_counts.entry(membership.collection_id).or_insert(0) += 1;
+            *membership_counts
+                .entry(membership.collection_id)
+                .or_insert(0) += 1;
         }
 
         // assign 0-based index per membership and update collection's n_members
-        let mut collection_indices: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        let mut collection_indices: std::collections::HashMap<i64, usize> =
+            std::collections::HashMap::new();
 
         for membership in self.membership.values_mut() {
             let collection_id = membership.collection_id;
@@ -1397,8 +1657,10 @@ impl SolutionDataset {
     }
 
     fn update_table_key_indexes_mapping(&mut self) -> Result<()> {
-        let mut key_indexes_mapping: std::collections::HashMap<String, Vec<i64>> = Default::default();
-        let mut units_mapping: std::collections::HashMap<String, (String, i64)> = Default::default();
+        let mut key_indexes_mapping: std::collections::HashMap<String, Vec<i64>> =
+            Default::default();
+        let mut units_mapping: std::collections::HashMap<String, (String, i64)> =
+            Default::default();
 
         for ki in self.key_index.values() {
             let key_id = ki.key_id;
@@ -1412,17 +1674,29 @@ impl SolutionDataset {
             let collection = self.collection(membership.collection_id)?;
             let property = self.property(key.property_id)?;
             let collection_name = collection.name.clone();
-            let property_name = if key.is_summary { property.summary_name() } else { property.property_name() };
-            let unit_id = if property.is_summary { property.summary_unit_id } else { property.unit_id };
+            let property_name = if key.is_summary {
+                property.summary_name()
+            } else {
+                property.property_name()
+            };
+            let unit_id = if property.is_summary {
+                property.summary_unit_id
+            } else {
+                property.unit_id
+            };
             let unit = self.unit(unit_id)?;
             let unit_name = unit.value.clone();
             let period_offset = ki.period_offset;
 
-            let table_name = format!("{phase_name}__{period_name}__{collection_name}__{property_name}")
-                .replace(" ", "_")
-                .replace("-", "_");
+            let table_name =
+                format!("{phase_name}__{period_name}__{collection_name}__{property_name}")
+                    .replace(" ", "_")
+                    .replace("-", "_");
 
-            key_indexes_mapping.entry(table_name.clone()).or_default().push(key_id);
+            key_indexes_mapping
+                .entry(table_name.clone())
+                .or_default()
+                .push(key_id);
             units_mapping.insert(table_name, (unit_name, period_offset));
         }
         self.table_key_index_mapping = key_indexes_mapping;
@@ -1446,12 +1720,17 @@ impl SolutionDataset {
         let mut step_index = 0;
         let mut direct_stage_dir = None;
         Self::report_duckdb_progress(&mut progress, "Initializing DuckDB");
-        let mut con =
-            Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Initializing DuckDB", |_progress| {
+        let mut con = Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Initializing DuckDB",
+            |_progress| {
                 let (con, stage_dir) = Self::open_duckdb_write_connection(db_path, mode)?;
                 direct_stage_dir = stage_dir;
                 Ok(con)
-            })?;
+            },
+        )?;
 
         Self::report_duckdb_progress(&mut progress, "Configuring DuckDB session");
         Self::with_duckdb_step(
@@ -1466,113 +1745,219 @@ impl SolutionDataset {
         )?;
 
         Self::report_duckdb_progress(&mut progress, "Creating raw schema");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Creating raw schema", |_progress| {
-            con.execute_batch("CREATE SCHEMA IF NOT EXISTS raw;")?;
-            Ok(())
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Creating raw schema",
+            |_progress| {
+                con.execute_batch("CREATE SCHEMA IF NOT EXISTS raw;")?;
+                Ok(())
+            },
+        )?;
 
         Self::report_duckdb_progress(&mut progress, "Writing metadata");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing metadata", |progress| {
-            self.populate_table_metadata(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing metadata",
+            |progress| self.populate_table_metadata(&mut con, progress),
+        )?;
 
         Self::report_duckdb_progress(&mut progress, "Writing config");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing config", |progress| {
-            self.populate_table_config(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing config",
+            |progress| self.populate_table_config(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing memberships");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing memberships", |progress| {
-            self.populate_table_memberships(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing memberships",
+            |progress| self.populate_table_memberships(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing collections");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing collections", |progress| {
-            self.populate_table_collections(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing collections",
+            |progress| self.populate_table_collections(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing classes");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing classes", |progress| {
-            self.populate_table_classes(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing classes",
+            |progress| self.populate_table_classes(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing class groups");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing class groups", |progress| {
-            self.populate_table_class_groups(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing class groups",
+            |progress| self.populate_table_class_groups(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing categories");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing categories", |progress| {
-            self.populate_table_categories(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing categories",
+            |progress| self.populate_table_categories(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing bands");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing bands", |progress| {
-            self.populate_table_bands(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing bands",
+            |progress| self.populate_table_bands(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing models");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing models", |progress| {
-            self.populate_table_models(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing models",
+            |progress| self.populate_table_models(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing objects");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing objects", |progress| {
-            self.populate_table_objects(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing objects",
+            |progress| self.populate_table_objects(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing keys");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing keys", |progress| {
-            self.populate_table_keys(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing keys",
+            |progress| self.populate_table_keys(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing key indexes");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing key indexes", |progress| {
-            self.populate_table_key_indexes(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing key indexes",
+            |progress| self.populate_table_key_indexes(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing properties");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing properties", |progress| {
-            self.populate_table_properties(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing properties",
+            |progress| self.populate_table_properties(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing timeslices");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing timeslices", |progress| {
-            self.populate_table_timeslices(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing timeslices",
+            |progress| self.populate_table_timeslices(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing samples");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing samples", |progress| {
-            self.populate_table_samples(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing samples",
+            |progress| self.populate_table_samples(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing units");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing units", |progress| {
-            self.populate_table_units(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing units",
+            |progress| self.populate_table_units(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing memo objects");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing memo objects", |progress| {
-            self.populate_table_memo_objects(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing memo objects",
+            |progress| self.populate_table_memo_objects(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing custom columns");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing custom columns", |progress| {
-            self.populate_table_custom_columns(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing custom columns",
+            |progress| self.populate_table_custom_columns(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing attribute data");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing attribute data", |progress| {
-            self.populate_table_attribute_data(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing attribute data",
+            |progress| self.populate_table_attribute_data(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing attributes");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing attributes", |progress| {
-            self.populate_table_attributes(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing attributes",
+            |progress| self.populate_table_attributes(&mut con, progress),
+        )?;
         Self::report_duckdb_progress(&mut progress, "Writing timestamp blocks");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing timestamp blocks", |progress| {
-            self.populate_table_timestamps_block(&mut con, progress)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing timestamp blocks",
+            |progress| self.populate_table_timestamps_block(&mut con, progress),
+        )?;
 
         Self::report_duckdb_progress(&mut progress, "Writing time series data");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Writing time series data", |progress| {
-            self.populate_table_data(&mut con, progress, data_write_threads)
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Writing time series data",
+            |progress| self.populate_table_data(&mut con, progress, data_write_threads),
+        )?;
 
         Self::report_duckdb_progress(&mut progress, "Creating processed views");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Creating processed views", |_progress| {
-            self.create_processed_views(&mut con)?;
-            Ok(())
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Creating processed views",
+            |_progress| {
+                self.create_processed_views(&mut con)?;
+                Ok(())
+            },
+        )?;
 
         Self::report_duckdb_progress(&mut progress, "Creating report views");
-        Self::with_duckdb_step(&mut progress, &mut step_index, total_steps, "Creating report views", |_progress| {
-            self.create_report_views(&mut con)?;
-            Ok(())
-        })?;
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            "Creating report views",
+            |_progress| {
+                self.create_report_views(&mut con)?;
+                Ok(())
+            },
+        )?;
 
         Self::report_duckdb_progress(&mut progress, "Persisting DuckDB database");
         Self::with_duckdb_step(
@@ -1615,9 +2000,14 @@ impl SolutionDataset {
             let mut estimated_values = 0u128;
             for key_id in key_ids.iter().copied() {
                 let length = self.key_index(key_id)?.length;
-                estimated_values = estimated_values.checked_add(u128::from(length)).ok_or_else(|| {
-                    eyre!("Estimated workload overflow for table '{}' while planning data writes", table_name)
-                })?;
+                estimated_values = estimated_values
+                    .checked_add(u128::from(length))
+                    .ok_or_else(|| {
+                        eyre!(
+                            "Estimated workload overflow for table '{}' while planning data writes",
+                            table_name
+                        )
+                    })?;
             }
 
             plans.push(DataTableWritePlan {
@@ -1641,13 +2031,11 @@ impl SolutionDataset {
 
         match configured_threads {
             Some(threads) => threads.max(1).min(total_tables),
-            None => {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-                    .min(MAX_AUTO_DATA_WRITE_THREADS)
-                    .min(total_tables)
-            },
+            None => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(MAX_AUTO_DATA_WRITE_THREADS)
+                .min(total_tables),
         }
     }
 
@@ -1694,13 +2082,16 @@ impl SolutionDataset {
         let staged_shards = std::thread::scope(|scope| -> Result<Vec<StagedDataShard>> {
             let mut handles = Vec::with_capacity(worker_plans.len());
             for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
-                let shard_path = staging_dir.path().join(format!("data_stage_{worker_idx}.duckdb"));
+                let shard_path = staging_dir
+                    .path()
+                    .join(format!("data_stage_{worker_idx}.duckdb"));
                 let worker_tx = tx.clone();
 
                 handles.push(scope.spawn(move || -> Result<StagedDataShard> {
                     let mut worker_con = duckdb::Connection::open(&shard_path)?;
-                    worker_con
-                        .execute_batch("SET preserve_insertion_order = false; CREATE SCHEMA IF NOT EXISTS data;")?;
+                    worker_con.execute_batch(
+                        "SET preserve_insertion_order = false; CREATE SCHEMA IF NOT EXISTS data;",
+                    )?;
 
                     let worker_total = worker_plan.len();
                     for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
@@ -1725,7 +2116,9 @@ impl SolutionDataset {
                         });
                     }
 
-                    Ok(StagedDataShard { db_path: shard_path })
+                    Ok(StagedDataShard {
+                        db_path: shard_path,
+                    })
                 }));
             }
             drop(tx);
@@ -1740,7 +2133,13 @@ impl SolutionDataset {
                     )
                 })?;
                 match event {
-                    DataWriteWorkerEvent::TableStarted { worker_id, index, total, table_name, keys } => {
+                    DataWriteWorkerEvent::TableStarted {
+                        worker_id,
+                        index,
+                        total,
+                        table_name,
+                        keys,
+                    } => {
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableStart {
                                 worker_id,
@@ -1751,7 +2150,13 @@ impl SolutionDataset {
                             }));
                         }
                     },
-                    DataWriteWorkerEvent::TableCompleted { worker_id, index, total, table_name, keys } => {
+                    DataWriteWorkerEvent::TableCompleted {
+                        worker_id,
+                        index,
+                        total,
+                        table_name,
+                        keys,
+                    } => {
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableEnd {
                                 worker_id,
@@ -1777,7 +2182,9 @@ impl SolutionDataset {
             let mut shards = Vec::with_capacity(handles.len());
             Self::report_duckdb_progress(progress, "Finalizing staged worker shards");
             for handle in handles {
-                let result = handle.join().map_err(|_| eyre!("A data writer thread panicked"))?;
+                let result = handle
+                    .join()
+                    .map_err(|_| eyre!("A data writer thread panicked"))?;
                 shards.push(result?);
             }
             Ok(shards)
@@ -1796,10 +2203,14 @@ impl SolutionDataset {
         let mut worker_loads = vec![0u128; worker_count];
 
         for plan in plans {
-            let (worker_idx, _) =
-                worker_loads.iter().enumerate().min_by_key(|(_, load)| **load).expect("worker_count must be non-zero");
+            let (worker_idx, _) = worker_loads
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, load)| **load)
+                .expect("worker_count must be non-zero");
 
-            worker_loads[worker_idx] = worker_loads[worker_idx].saturating_add(plan.estimated_values);
+            worker_loads[worker_idx] =
+                worker_loads[worker_idx].saturating_add(plan.estimated_values);
             worker_plans[worker_idx].push(plan);
         }
 
@@ -1832,7 +2243,9 @@ impl SolutionDataset {
             }
 
             con.execute_batch(&format!("ATTACH '{db_path}' AS {shard_alias_ident};"))?;
-            con.execute_batch(&format!("COPY FROM DATABASE {shard_alias_ident} TO {target_catalog_ident};"))?;
+            con.execute_batch(&format!(
+                "COPY FROM DATABASE {shard_alias_ident} TO {target_catalog_ident};"
+            ))?;
             con.execute_batch(&format!("DETACH {shard_alias_ident};"))?;
 
             if let Some(report) = progress.as_mut() {
@@ -1846,7 +2259,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn append_single_data_table(&self, con: &mut duckdb::Connection, plan: &DataTableWritePlan) -> Result<()> {
+    fn append_single_data_table(
+        &self,
+        con: &mut duckdb::Connection,
+        plan: &DataTableWritePlan,
+    ) -> Result<()> {
         self.create_data_table(con, plan.table_name.as_str())?;
         let mut appender = con.appender_to_db(plan.table_name.as_str(), "data")?;
 
@@ -1863,27 +2280,40 @@ impl SolutionDataset {
                 .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
 
             if ki.position % 8 != 0 {
-                return Err(eyre!("BIN position misaligned for key_id {} (pos_bytes={})", key_id, ki.position));
+                return Err(eyre!(
+                    "BIN position misaligned for key_id {} (pos_bytes={})",
+                    key_id,
+                    ki.position
+                ));
             }
 
             let period_offset: i64 = ki.period_offset;
             let mut i: u64 = 0;
             while i < ki.length {
                 let chunk_values = (ki.length - i).min(DATA_READ_CHUNK_VALUES);
-                let chunk_bytes_u64 =
-                    chunk_values.checked_mul(8).ok_or_else(|| eyre!("Chunk size overflow for key_id {}", key_id))?;
+                let chunk_bytes_u64 = chunk_values
+                    .checked_mul(8)
+                    .ok_or_else(|| eyre!("Chunk size overflow for key_id {}", key_id))?;
                 let chunk_bytes = usize::try_from(chunk_bytes_u64)
                     .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", key_id))?;
-                let offset_delta =
-                    i.checked_mul(8).ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
+                let offset_delta = i
+                    .checked_mul(8)
+                    .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
                 let chunk_offset = ki
                     .position
                     .checked_add(offset_delta)
                     .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
 
-                period_data.read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes]).map_err(|err| {
-                    eyre!("Failed reading period data for key_id {} at byte offset {}: {}", key_id, chunk_offset, err)
-                })?;
+                period_data
+                    .read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes])
+                    .map_err(|err| {
+                        eyre!(
+                            "Failed reading period data for key_id {} at byte offset {}: {}",
+                            key_id,
+                            chunk_offset,
+                            err
+                        )
+                    })?;
 
                 let mut chunk_i: u64 = 0;
                 while chunk_i < chunk_values {
@@ -1972,7 +2402,9 @@ impl SolutionDataset {
                     .parent()
                     .filter(|path| !path.as_os_str().is_empty())
                     .unwrap_or_else(|| std::path::Path::new("."));
-                let staging_dir = tempfile::Builder::new().prefix("plexos2duckdb-stage-").tempdir_in(staging_parent)?;
+                let staging_dir = tempfile::Builder::new()
+                    .prefix("plexos2duckdb-stage-")
+                    .tempdir_in(staging_parent)?;
                 let staging_path = staging_dir.path().join("stage.duckdb");
                 Ok((duckdb::Connection::open(staging_path)?, Some(staging_dir)))
             },
@@ -2020,7 +2452,10 @@ impl SolutionDataset {
             while read_total < buf.len() {
                 let n = file.seek_read(&mut buf[read_total..], offset + read_total as u64)?;
                 if n == 0 {
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "failed to fill whole buffer",
+                    ));
                 }
                 read_total += n;
             }
@@ -2105,7 +2540,12 @@ impl SolutionDataset {
             let parent_category_class = self.class(parent_category.class_id)?;
             let parent_class = self.class(membership.parent_class_id)?;
             let collection_name = self.collection_name(membership.collection_id)?;
-            let kind = if self.is_object(membership.collection_id)? { "object" } else { "relation" }.to_string();
+            let kind = if self.is_object(membership.collection_id)? {
+                "object"
+            } else {
+                "relation"
+            }
+            .to_string();
 
             appender.append_row(duckdb::params![
                 membership.membership_id,
@@ -2184,7 +2624,11 @@ impl SolutionDataset {
         let mut appender = con.appender_to_db("classes", "raw")?;
 
         for class in self.class.values() {
-            appender.append_row(duckdb::params![class.class_id, class.name, class.class_group_id])?;
+            appender.append_row(duckdb::params![
+                class.class_id,
+                class.name,
+                class.class_group_id
+            ])?;
         }
 
         appender.flush()?;
@@ -2209,7 +2653,10 @@ impl SolutionDataset {
         let mut appender = con.appender_to_db("class_groups", "raw")?;
 
         for class_group in self.class_group.values() {
-            appender.append_row(duckdb::params![class_group.class_group_id, class_group.name])?;
+            appender.append_row(duckdb::params![
+                class_group.class_group_id,
+                class_group.name
+            ])?;
         }
 
         appender.flush()?;
@@ -2493,7 +2940,11 @@ impl SolutionDataset {
             let sample_weight = self
                 .sample_weight(sample.sample_id)
                 .cloned()
-                .unwrap_or_else(|_| SampleWeight { sample_id: sample.sample_id, phase_id: 0, weight: 0.0 });
+                .unwrap_or_else(|_| SampleWeight {
+                    sample_id: sample.sample_id,
+                    phase_id: 0,
+                    weight: 0.0,
+                });
 
             appender.append_row(duckdb::params![
                 sample.sample_id,
@@ -2570,7 +3021,12 @@ impl SolutionDataset {
         )?;
         let mut appender = con.appender_to_db("custom_columns", "raw")?;
         for (_, column) in self.custom_column.iter() {
-            appender.append_row(duckdb::params![column.column_id, column.name, column.position, column.class_id])?;
+            appender.append_row(duckdb::params![
+                column.column_id,
+                column.name,
+                column.position,
+                column.class_id
+            ])?;
         }
         appender.flush()?;
 
@@ -2643,7 +3099,10 @@ impl SolutionDataset {
 
         let mut appender = con.appender("plexos2duckdb")?;
         appender.append_row(duckdb::params!["plexos2duckdb_version", utils::version()])?;
-        appender.append_row(duckdb::params!["duckdb_file_created_at", chrono::Utc::now().to_string()])?;
+        appender.append_row(duckdb::params![
+            "duckdb_file_created_at",
+            chrono::Utc::now().to_string()
+        ])?;
         appender.append_row(duckdb::params!["plexos_file", self.file.to_str()])?;
         appender.append_row(duckdb::params!["model_name", self.model_name])?;
 
@@ -2686,9 +3145,18 @@ impl SolutionDataset {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS report;")?;
 
         for table_name in self.table_key_index_mapping.keys() {
-            let phase_name = table_name.split("__").next().ok_or_else(|| eyre!("Phase name not found"))?;
-            let period_name = table_name.split("__").nth(1).ok_or_else(|| eyre!("Period name not found"))?;
-            let property_name = table_name.split("__").nth(3).ok_or_else(|| eyre!("Property name not found"))?;
+            let phase_name = table_name
+                .split("__")
+                .next()
+                .ok_or_else(|| eyre!("Phase name not found"))?;
+            let period_name = table_name
+                .split("__")
+                .nth(1)
+                .ok_or_else(|| eyre!("Period name not found"))?;
+            let property_name = table_name
+                .split("__")
+                .nth(3)
+                .ok_or_else(|| eyre!("Property name not found"))?;
             con.execute_batch(&format!(
                 "
                 CREATE VIEW report.\"{table_name}\" AS SELECT
@@ -2832,29 +3300,41 @@ impl SolutionDataset {
     }
 
     fn collection_name(&self, collection_id: i64) -> Result<String> {
-        let collection =
-            self.collection.get(&collection_id).ok_or(eyre!("Collection not found for {collection_id}"))?;
+        let collection = self
+            .collection
+            .get(&collection_id)
+            .ok_or(eyre!("Collection not found for {collection_id}"))?;
         let collection_name = collection.name.clone();
 
         let prefix = if let Some(name) = collection.complement_name.as_deref() {
             name
         } else {
-            self.class.get(&collection.parent_class_id).ok_or_else(|| eyre!("Parent class not found"))?.name.as_str()
+            self.class
+                .get(&collection.parent_class_id)
+                .ok_or_else(|| eyre!("Parent class not found"))?
+                .name
+                .as_str()
         };
 
         Ok(format!("{prefix}_{collection_name}"))
     }
 
     fn object(&self, object_id: i64) -> Result<&Object> {
-        self.object.get(&object_id).ok_or_else(|| eyre!("Object not found for {object_id}"))
+        self.object
+            .get(&object_id)
+            .ok_or_else(|| eyre!("Object not found for {object_id}"))
     }
 
     fn category(&self, category_id: i64) -> Result<&Category> {
-        self.category.get(&category_id).ok_or_else(|| eyre!("Category not found for {category_id}"))
+        self.category
+            .get(&category_id)
+            .ok_or_else(|| eyre!("Category not found for {category_id}"))
     }
 
     fn attribute(&self, attribute_id: i64) -> Result<&Attribute> {
-        self.attribute.get(&attribute_id).ok_or_else(|| eyre!("Attribute not found for {attribute_id}"))
+        self.attribute
+            .get(&attribute_id)
+            .ok_or_else(|| eyre!("Attribute not found for {attribute_id}"))
     }
 
     fn object_name(&self, object_id: i64) -> Result<String> {
@@ -2866,43 +3346,63 @@ impl SolutionDataset {
     }
 
     fn membership(&self, membership_id: i64) -> Result<&Membership> {
-        self.membership.get(&membership_id).ok_or_else(|| eyre!("Membership not found for {membership_id}"))
+        self.membership
+            .get(&membership_id)
+            .ok_or_else(|| eyre!("Membership not found for {membership_id}"))
     }
 
     fn class(&self, class_id: i64) -> Result<&Class> {
-        self.class.get(&class_id).ok_or_else(|| eyre!("Class not found for {class_id}"))
+        self.class
+            .get(&class_id)
+            .ok_or_else(|| eyre!("Class not found for {class_id}"))
     }
 
     fn collection(&self, collection_id: i64) -> Result<&Collection> {
-        self.collection.get(&collection_id).ok_or_else(|| eyre!("Collection not found for {collection_id}"))
+        self.collection
+            .get(&collection_id)
+            .ok_or_else(|| eyre!("Collection not found for {collection_id}"))
     }
 
     fn property(&self, property_id: i64) -> Result<&Property> {
-        self.property.get(&property_id).ok_or_else(|| eyre!("Property not found for {property_id}"))
+        self.property
+            .get(&property_id)
+            .ok_or_else(|| eyre!("Property not found for {property_id}"))
     }
 
     fn unit(&self, unit_id: i64) -> Result<&Unit> {
-        self.unit.get(&unit_id).ok_or_else(|| eyre!("Unit not found for {unit_id}"))
+        self.unit
+            .get(&unit_id)
+            .ok_or_else(|| eyre!("Unit not found for {unit_id}"))
     }
 
     fn band(&self, band_id: i64) -> Result<&Band> {
-        self.band.get(&band_id).ok_or_else(|| eyre!("Band not found for {band_id}"))
+        self.band
+            .get(&band_id)
+            .ok_or_else(|| eyre!("Band not found for {band_id}"))
     }
 
     fn sample(&self, sample_id: i64) -> Result<&Sample> {
-        self.sample.get(&sample_id).ok_or_else(|| eyre!("Sample not found for {sample_id}"))
+        self.sample
+            .get(&sample_id)
+            .ok_or_else(|| eyre!("Sample not found for {sample_id}"))
     }
 
     fn sample_weight(&self, sample_id: i64) -> Result<&SampleWeight> {
-        self.sample_weight.get(&sample_id).ok_or_else(|| eyre!("Sample weight not found for {sample_id}"))
+        self.sample_weight
+            .get(&sample_id)
+            .ok_or_else(|| eyre!("Sample weight not found for {sample_id}"))
     }
 
     fn timeslice(&self, timeslice_id: i64) -> Result<&Timeslice> {
-        self.timeslice.get(&timeslice_id).ok_or_else(|| eyre!("Timeslice not found for {timeslice_id}"))
+        self.timeslice
+            .get(&timeslice_id)
+            .ok_or_else(|| eyre!("Timeslice not found for {timeslice_id}"))
     }
 
     fn key_index(&self, key_id: i64) -> Result<&KeyIndex> {
-        self.key_index.get(&key_id).ok_or_else(|| eyre!("Key index not found for {key_id}"))
+        self.key_index
+            .get(&key_id)
+            .ok_or_else(|| eyre!("Key index not found for {key_id}"))
     }
 
     fn membership_name(&self, membership_id: i64) -> Result<String> {
@@ -2914,7 +3414,11 @@ impl SolutionDataset {
         let child_object = self.object(membership.child_object_id)?;
         Ok(format!(
             "{}_{}_{}_{}_{}",
-            collection_name, parent_class.name, child_class.name, parent_object.name, child_object.name
+            collection_name,
+            parent_class.name,
+            child_class.name,
+            parent_object.name,
+            child_object.name
         ))
     }
 
@@ -3011,7 +3515,10 @@ impl SolutionDataset {
     }
 
     fn key(&self, key_id: i64) -> Result<Key> {
-        self.key.get(&key_id).cloned().ok_or_else(|| eyre!("Key with {} not found", key_id))
+        self.key
+            .get(&key_id)
+            .cloned()
+            .ok_or_else(|| eyre!("Key with {} not found", key_id))
     }
 
     pub fn print_summary(&self) {
@@ -3066,13 +3573,23 @@ mod tests {
 
     fn assert_small_database(db_path: &std::path::Path) -> Result<()> {
         let wal_path = std::path::PathBuf::from(format!("{}.wal", db_path.to_string_lossy()));
-        assert!(db_path.exists(), "expected persisted database at {}", db_path.display());
-        assert!(!wal_path.exists(), "expected checkpointed database without WAL sidecar at {}", wal_path.display());
+        assert!(
+            db_path.exists(),
+            "expected persisted database at {}",
+            db_path.display()
+        );
+        assert!(
+            !wal_path.exists(),
+            "expected checkpointed database without WAL sidecar at {}",
+            wal_path.display()
+        );
 
         let con = duckdb::Connection::open(db_path)?;
         let mut stmt = con.prepare("SELECT COUNT(*), SUM(value) FROM numbers;")?;
         let mut rows = stmt.query([])?;
-        let row = rows.next()?.ok_or_else(|| eyre!("expected numbers query to return a row"))?;
+        let row = rows
+            .next()?
+            .ok_or_else(|| eyre!("expected numbers query to return a row"))?;
         let row_count: i64 = row.get(0)?;
         let total: i64 = row.get(1)?;
         assert_eq!(row_count, 3);
@@ -3113,6 +3630,9 @@ fn parse_datetime_to_utc(input: &str) -> Result<chrono::DateTime<chrono::Utc>> {
         Ok(dt_with_tz.with_timezone(&chrono::Utc))
     } else {
         let naive = chrono::NaiveDateTime::parse_from_str(input, "%Y-%m-%dT%H:%M:%S")?;
-        Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc))
+        Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ))
     }
 }
