@@ -1,24 +1,31 @@
 #!/usr/bin/env -S uv run --script
-# [MISE] description="Automate the fork-backed release flow and mirror assets to upstream"
+# [MISE] dir="{{cwd}}"
+# [MISE] description="Recommended release entrypoint after toolchain setup: mirror assets from your fork to upstream"
+# [MISE] quiet=true
+# [MISE] raw=true
 # [USAGE] about "Automate the fork-backed release flow for plexos2duckdb"
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.14"
+# dependencies = [
+#   "cyclopts>=4.10.2",
+#   "rich>=14.1.0",
+# ]
 # ///
 
-from __future__ import annotations
-
-import argparse
+import dataclasses
 import datetime as dt
 import json
 import os
-from pathlib import Path
+import pathlib
 import re
 import shlex
 import subprocess
-import sys
 import time
-from typing import Any
-from urllib.parse import urlparse
+import typing
+import urllib.parse
+
+import cyclopts
+import rich.console
 
 DEFAULT_UPSTREAM_REPO = "epri-dev/plexos2duckdb"
 DEFAULT_WORKFLOW = "cd.yml"
@@ -27,220 +34,387 @@ RUN_LOOKUP_TIMEOUT_SECONDS = 90
 RELEASE_ASSET_TIMEOUT_SECONDS = 120
 POLL_INTERVAL_SECONDS = 3
 
+APP_HELP = """\
+Automate the fork-backed release flow for plexos2duckdb.
+
+Recommended order for someone new to the project:
+  0. mise run plexos2duckdb:ensure-rust-toolchain
+  1. Preferred: mise run plexos2duckdb:release-via-fork -- mirror TAG
+
+Manual release order if you need to inspect each stage:
+  1. mise run plexos2duckdb:release-sync-fork -- --fork-repo OWNER/REPO
+  2. mise run plexos2duckdb:release-build-on-fork -- TAG --fork-repo OWNER/REPO
+  3. mise run plexos2duckdb:release-download-fork-assets -- TAG --fork-repo OWNER/REPO
+  4. mise run plexos2duckdb:release-upload-upstream-assets -- TAG --fork-repo OWNER/REPO
+
+Environment variables:
+  PLEXOS2DUCKDB_FORK_REPO            Fork repo in OWNER/REPO format.
+  PLEXOS2DUCKDB_UPSTREAM_REPO        Upstream repo. Default: epri-dev/plexos2duckdb
+  PLEXOS2DUCKDB_RELEASE_BRANCH       Branch to sync and tag. Default: local origin HEAD or main.
+  PLEXOS2DUCKDB_RELEASE_WORKFLOW     Workflow file name. Default: cd.yml
+  PLEXOS2DUCKDB_RELEASE_WORKFLOW_REF Ref containing the workflow file. Default: release branch.
+  PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR Download dir template. Default: dist/releases/{tag}
+
+Examples:
+  mise run plexos2duckdb:release-via-fork -- mirror v0.1.0-beta.8 --fork-repo YOURUSER/plexos2duckdb
+  mise run plexos2duckdb:release-via-fork -- build-on-fork v0.1.0-beta.8 --fork-repo YOURUSER/plexos2duckdb
+  mise run plexos2duckdb:release-via-fork -- upload-upstream-assets v0.1.0-beta.8 --fork-repo YOURUSER/plexos2duckdb
+"""
+
+app = cyclopts.App(help=APP_HELP)
+stdout_console = rich.console.Console()
+stderr_console = rich.console.Console(stderr=True)
+
+ForkRepoOption = typing.Annotated[
+    str | None,
+    cyclopts.Parameter(
+        name=("--fork-repo",),
+        help="Fork repo in OWNER/REPO format. Required unless PLEXOS2DUCKDB_FORK_REPO is set.",
+    ),
+]
+UpstreamRepoOption = typing.Annotated[
+    str | None,
+    cyclopts.Parameter(
+        name=("--upstream-repo",),
+        help="Upstream repo in OWNER/REPO format.",
+    ),
+]
+BranchOption = typing.Annotated[
+    str | None,
+    cyclopts.Parameter(
+        name=("--branch",),
+        help="Branch to sync from upstream and target when creating releases.",
+    ),
+]
+WorkflowOption = typing.Annotated[
+    str | None,
+    cyclopts.Parameter(
+        name=("--workflow",),
+        help="Workflow file name to dispatch on the fork.",
+    ),
+]
+WorkflowRefOption = typing.Annotated[
+    str | None,
+    cyclopts.Parameter(
+        name=("--workflow-ref",),
+        help="Branch or tag containing the workflow file. Defaults to --branch.",
+    ),
+]
+DownloadDirOption = typing.Annotated[
+    str | None,
+    cyclopts.Parameter(
+        name=("--download-dir",),
+        help=(
+            "Directory or template. "
+            "Defaults to dist/releases/{tag} or $PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR."
+        ),
+    ),
+]
+TagArgument = typing.Annotated[
+    str,
+    cyclopts.Parameter(
+        help="Release tag to build and mirror, for example v0.1.0-beta.8.",
+    ),
+]
+AllowExistingForkAssetsOption = typing.Annotated[
+    bool,
+    cyclopts.Parameter(
+        name=("--allow-existing-fork-assets",),
+        help="Reuse an existing fork release with assets instead of dispatching the workflow again.",
+    ),
+]
+ForceSyncOption = typing.Annotated[
+    bool,
+    cyclopts.Parameter(
+        name=("--force-sync",),
+        help="Allow gh repo sync to hard-reset the fork branch to upstream.",
+    ),
+]
+SkipSyncOption = typing.Annotated[
+    bool,
+    cyclopts.Parameter(
+        name=("--skip-sync",),
+        help="Skip syncing the fork branch before dispatching the workflow.",
+    ),
+]
+ClobberOption = typing.Annotated[
+    bool,
+    cyclopts.Parameter(
+        name=("--clobber",),
+        help="Overwrite matching assets instead of skipping existing ones.",
+    ),
+]
+ReleaseJson = dict[str, typing.Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class ReleaseArguments:
+    fork_repo: str | None
+    upstream_repo: str
+    branch: str
+    workflow: str
+    workflow_ref: str | None
+    tag: str | None = None
+    download_dir: str | None = None
+    allow_existing_fork_assets: bool = False
+    force_sync: bool = False
+    skip_sync: bool = False
+    clobber: bool = False
+
 
 class CommandError(RuntimeError):
     """Raised when a required external command fails."""
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+def show_message(message: str) -> None:
+    stdout_console.print(message, markup=False)
 
+
+def show_command(cmd: list[str]) -> None:
+    show_message(f"+ {' '.join(shlex.quote(part) for part in cmd)}")
+
+
+def main() -> int:
     try:
-        args.func(args)
+        app()
     except CommandError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        stderr_console.print(f"[red]Error:[/red] {exc}")
         return 1
     except Exception as exc:
-        print(
-            f"Unexpected error: {exc.__class__.__name__}: {exc}",
-            file=sys.stderr,
+        stderr_console.print(
+            f"[red]Unexpected error:[/red] {exc.__class__.__name__}: {exc}"
         )
         return 1
 
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Automate the fork-backed release flow for plexos2duckdb.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Environment variables:\n"
-            "  PLEXOS2DUCKDB_FORK_REPO            Fork repo in OWNER/REPO format.\n"
-            "  PLEXOS2DUCKDB_UPSTREAM_REPO        Upstream repo. Default: epri-dev/plexos2duckdb\n"
-            "  PLEXOS2DUCKDB_RELEASE_BRANCH       Branch to sync and tag. Default: local origin HEAD or main.\n"
-            "  PLEXOS2DUCKDB_RELEASE_WORKFLOW     Workflow file name. Default: cd.yml\n"
-            "  PLEXOS2DUCKDB_RELEASE_WORKFLOW_REF Ref containing the workflow file. Default: release branch.\n"
-            "  PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR Download dir template. Default: dist/releases/{tag}\n\n"
-            "Examples:\n"
-            "  mise run plexos2duckdb:release-via-fork -- mirror v0.1.0-beta.8 --fork-repo YOURUSER/plexos2duckdb\n"
-            "  mise run plexos2duckdb:release-build-on-fork -- v0.1.0-beta.8 --fork-repo YOURUSER/plexos2duckdb\n"
-            "  mise run plexos2duckdb:release-upload-upstream-assets -- v0.1.0-beta.8 --fork-repo YOURUSER/plexos2duckdb\n"
-        ),
-    )
-
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    sync_parser = subparsers.add_parser(
-        "sync-fork",
-        help="Sync the fork branch from upstream.",
-    )
-    add_repo_options(sync_parser, include_tag=False)
-    sync_parser.add_argument(
-        "--force-sync",
-        action="store_true",
-        help="Allow gh repo sync to hard-reset the fork branch to upstream.",
-    )
-    sync_parser.set_defaults(func=cmd_sync_fork)
-
-    build_parser_cmd = subparsers.add_parser(
-        "build-on-fork",
-        help="Create or reuse the fork release, dispatch the workflow, and wait for assets.",
-    )
-    add_repo_options(build_parser_cmd, include_tag=True)
-    build_parser_cmd.add_argument(
-        "--allow-existing-fork-assets",
-        action="store_true",
-        help="Reuse an existing fork release with assets instead of dispatching the workflow again.",
-    )
-    build_parser_cmd.add_argument(
-        "--force-sync",
-        action="store_true",
-        help="Allow gh repo sync to hard-reset the fork branch to upstream.",
-    )
-    build_parser_cmd.add_argument(
-        "--skip-sync",
-        action="store_true",
-        help="Skip syncing the fork branch before dispatching the workflow.",
-    )
-    build_parser_cmd.set_defaults(func=cmd_build_on_fork)
-
-    download_parser = subparsers.add_parser(
-        "download-fork-assets",
-        help="Download release assets from the fork release into the local dist directory.",
-    )
-    add_repo_options(download_parser, include_tag=True)
-    download_parser.add_argument(
-        "--download-dir",
-        help=(
-            "Download directory or template. "
-            "Default: dist/releases/{tag} or $PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR."
-        ),
-    )
-    download_parser.add_argument(
-        "--clobber",
-        action="store_true",
-        help="Overwrite existing local asset files while downloading.",
-    )
-    download_parser.set_defaults(func=cmd_download_fork_assets)
-
-    upload_parser = subparsers.add_parser(
-        "upload-upstream-assets",
-        help="Create the upstream release if needed and upload downloaded assets to it.",
-    )
-    add_repo_options(upload_parser, include_tag=True)
-    upload_parser.add_argument(
-        "--download-dir",
-        help=(
-            "Directory or template containing downloaded assets. "
-            "Default: dist/releases/{tag} or $PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR."
-        ),
-    )
-    upload_parser.add_argument(
-        "--clobber",
-        action="store_true",
-        help="Replace upstream assets with the same names before re-uploading them.",
-    )
-    upload_parser.set_defaults(func=cmd_upload_upstream_assets)
-
-    mirror_parser = subparsers.add_parser(
-        "mirror",
-        help="Sync the fork, build release assets on it, download them, and upload them upstream.",
-    )
-    add_repo_options(mirror_parser, include_tag=True)
-    mirror_parser.add_argument(
-        "--download-dir",
-        help=(
-            "Download directory or template. "
-            "Default: dist/releases/{tag} or $PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR."
-        ),
-    )
-    mirror_parser.add_argument(
-        "--allow-existing-fork-assets",
-        action="store_true",
-        help="Reuse an existing fork release with assets instead of dispatching the workflow again.",
-    )
-    mirror_parser.add_argument(
-        "--force-sync",
-        action="store_true",
-        help="Allow gh repo sync to hard-reset the fork branch to upstream.",
-    )
-    mirror_parser.add_argument(
-        "--clobber",
-        action="store_true",
-        help="Overwrite downloaded local assets and matching upstream release assets.",
-    )
-    mirror_parser.set_defaults(func=cmd_mirror)
-
-    return parser
+def resolve_fork_repo(value: str | None) -> str | None:
+    return value or os.environ.get("PLEXOS2DUCKDB_FORK_REPO")
 
 
-def add_repo_options(parser: argparse.ArgumentParser, *, include_tag: bool) -> None:
-    if include_tag:
-        parser.add_argument(
-            "tag", help="Release tag to build and mirror, for example v0.1.0-beta.8."
+def resolve_upstream_repo(value: str | None) -> str:
+    return (
+        value or os.environ.get("PLEXOS2DUCKDB_UPSTREAM_REPO") or infer_upstream_repo()
+    )
+
+
+def resolve_branch(value: str | None) -> str:
+    return (
+        value
+        or os.environ.get("PLEXOS2DUCKDB_RELEASE_BRANCH")
+        or infer_default_branch()
+    )
+
+
+def resolve_workflow(value: str | None) -> str:
+    return value or os.environ.get("PLEXOS2DUCKDB_RELEASE_WORKFLOW") or DEFAULT_WORKFLOW
+
+
+def resolve_workflow_ref(value: str | None) -> str | None:
+    return value or os.environ.get("PLEXOS2DUCKDB_RELEASE_WORKFLOW_REF")
+
+
+def build_release_arguments(
+    *,
+    fork_repo: str | None,
+    upstream_repo: str | None,
+    branch: str | None,
+    workflow: str | None = None,
+    workflow_ref: str | None = None,
+    tag: str | None = None,
+    download_dir: str | None = None,
+    allow_existing_fork_assets: bool = False,
+    force_sync: bool = False,
+    skip_sync: bool = False,
+    clobber: bool = False,
+) -> ReleaseArguments:
+    return ReleaseArguments(
+        fork_repo=resolve_fork_repo(fork_repo),
+        upstream_repo=resolve_upstream_repo(upstream_repo),
+        branch=resolve_branch(branch),
+        workflow=resolve_workflow(workflow),
+        workflow_ref=resolve_workflow_ref(workflow_ref),
+        tag=tag,
+        download_dir=download_dir,
+        allow_existing_fork_assets=allow_existing_fork_assets,
+        force_sync=force_sync,
+        skip_sync=skip_sync,
+        clobber=clobber,
+    )
+
+
+def require_tag(args: ReleaseArguments) -> str:
+    if args.tag:
+        return args.tag
+    raise CommandError("a release tag is required for this command")
+
+
+@app.command(name="sync-fork", help="Sync the fork branch from upstream.")
+def sync_fork_command(
+    fork_repo: ForkRepoOption = None,
+    upstream_repo: UpstreamRepoOption = None,
+    branch: BranchOption = None,
+    force_sync: ForceSyncOption = False,
+) -> None:
+    cmd_sync_fork(
+        build_release_arguments(
+            fork_repo=fork_repo,
+            upstream_repo=upstream_repo,
+            branch=branch,
+            force_sync=force_sync,
         )
-    parser.add_argument(
-        "--fork-repo",
-        default=os.environ.get("PLEXOS2DUCKDB_FORK_REPO"),
-        help="Fork repo in OWNER/REPO format. Required unless PLEXOS2DUCKDB_FORK_REPO is set.",
-    )
-    parser.add_argument(
-        "--upstream-repo",
-        default=os.environ.get("PLEXOS2DUCKDB_UPSTREAM_REPO") or infer_upstream_repo(),
-        help="Upstream repo in OWNER/REPO format.",
-    )
-    default_branch = (
-        os.environ.get("PLEXOS2DUCKDB_RELEASE_BRANCH") or infer_default_branch()
-    )
-    parser.add_argument(
-        "--branch",
-        default=default_branch,
-        help="Branch to sync from upstream and target when creating releases.",
-    )
-    parser.add_argument(
-        "--workflow",
-        default=os.environ.get("PLEXOS2DUCKDB_RELEASE_WORKFLOW", DEFAULT_WORKFLOW),
-        help="Workflow file name to dispatch on the fork.",
-    )
-    parser.add_argument(
-        "--workflow-ref",
-        default=os.environ.get("PLEXOS2DUCKDB_RELEASE_WORKFLOW_REF"),
-        help="Branch or tag containing the workflow file. Defaults to --branch.",
     )
 
 
-def cmd_sync_fork(args: argparse.Namespace) -> None:
+@app.command(
+    name="build-on-fork",
+    help="Create or reuse the fork release, dispatch the workflow, and wait for assets.",
+)
+def build_on_fork_command(
+    tag: TagArgument,
+    fork_repo: ForkRepoOption = None,
+    upstream_repo: UpstreamRepoOption = None,
+    branch: BranchOption = None,
+    workflow: WorkflowOption = None,
+    workflow_ref: WorkflowRefOption = None,
+    allow_existing_fork_assets: AllowExistingForkAssetsOption = False,
+    force_sync: ForceSyncOption = False,
+    skip_sync: SkipSyncOption = False,
+) -> None:
+    cmd_build_on_fork(
+        build_release_arguments(
+            tag=tag,
+            fork_repo=fork_repo,
+            upstream_repo=upstream_repo,
+            branch=branch,
+            workflow=workflow,
+            workflow_ref=workflow_ref,
+            allow_existing_fork_assets=allow_existing_fork_assets,
+            force_sync=force_sync,
+            skip_sync=skip_sync,
+        )
+    )
+
+
+@app.command(
+    name="download-fork-assets",
+    help="Download release assets from the fork release into the local dist directory.",
+)
+def download_fork_assets_command(
+    tag: TagArgument,
+    fork_repo: ForkRepoOption = None,
+    upstream_repo: UpstreamRepoOption = None,
+    branch: BranchOption = None,
+    workflow: WorkflowOption = None,
+    workflow_ref: WorkflowRefOption = None,
+    download_dir: DownloadDirOption = None,
+    clobber: ClobberOption = False,
+) -> None:
+    cmd_download_fork_assets(
+        build_release_arguments(
+            tag=tag,
+            fork_repo=fork_repo,
+            upstream_repo=upstream_repo,
+            branch=branch,
+            workflow=workflow,
+            workflow_ref=workflow_ref,
+            download_dir=download_dir,
+            clobber=clobber,
+        )
+    )
+
+
+@app.command(
+    name="upload-upstream-assets",
+    help="Create the upstream release if needed and upload downloaded assets to it.",
+)
+def upload_upstream_assets_command(
+    tag: TagArgument,
+    fork_repo: ForkRepoOption = None,
+    upstream_repo: UpstreamRepoOption = None,
+    branch: BranchOption = None,
+    workflow: WorkflowOption = None,
+    workflow_ref: WorkflowRefOption = None,
+    download_dir: DownloadDirOption = None,
+    clobber: ClobberOption = False,
+) -> None:
+    cmd_upload_upstream_assets(
+        build_release_arguments(
+            tag=tag,
+            fork_repo=fork_repo,
+            upstream_repo=upstream_repo,
+            branch=branch,
+            workflow=workflow,
+            workflow_ref=workflow_ref,
+            download_dir=download_dir,
+            clobber=clobber,
+        )
+    )
+
+
+@app.command(
+    name="mirror",
+    help="Sync the fork, build release assets on it, download them, and upload them upstream.",
+)
+def mirror_command(
+    tag: TagArgument,
+    fork_repo: ForkRepoOption = None,
+    upstream_repo: UpstreamRepoOption = None,
+    branch: BranchOption = None,
+    workflow: WorkflowOption = None,
+    workflow_ref: WorkflowRefOption = None,
+    download_dir: DownloadDirOption = None,
+    allow_existing_fork_assets: AllowExistingForkAssetsOption = False,
+    force_sync: ForceSyncOption = False,
+    clobber: ClobberOption = False,
+) -> None:
+    cmd_mirror(
+        build_release_arguments(
+            tag=tag,
+            fork_repo=fork_repo,
+            upstream_repo=upstream_repo,
+            branch=branch,
+            workflow=workflow,
+            workflow_ref=workflow_ref,
+            download_dir=download_dir,
+            allow_existing_fork_assets=allow_existing_fork_assets,
+            force_sync=force_sync,
+            clobber=clobber,
+        )
+    )
+
+
+def cmd_sync_fork(args: ReleaseArguments) -> None:
     ensure_gh_authentication()
-    validate_fork_repo(args.fork_repo)
+    fork_repo = validate_fork_repo(args.fork_repo)
     sync_fork_branch(
-        fork_repo=args.fork_repo,
+        fork_repo=fork_repo,
         upstream_repo=args.upstream_repo,
         branch=args.branch,
         force_sync=args.force_sync,
     )
 
 
-def cmd_build_on_fork(args: argparse.Namespace) -> None:
+def cmd_build_on_fork(args: ReleaseArguments) -> None:
     ensure_gh_authentication()
     validate_fork_repo(args.fork_repo)
     build_on_fork(args, sync_first=not args.skip_sync)
 
 
-def cmd_download_fork_assets(args: argparse.Namespace) -> None:
+def cmd_download_fork_assets(args: ReleaseArguments) -> None:
     ensure_gh_authentication()
     validate_fork_repo(args.fork_repo)
     download_fork_assets(args)
 
 
-def cmd_upload_upstream_assets(args: argparse.Namespace) -> None:
+def cmd_upload_upstream_assets(args: ReleaseArguments) -> None:
     ensure_gh_authentication()
     validate_fork_repo(args.fork_repo)
     upload_upstream_assets(args)
 
 
-def cmd_mirror(args: argparse.Namespace) -> None:
+def cmd_mirror(args: ReleaseArguments) -> None:
     ensure_gh_authentication()
     validate_fork_repo(args.fork_repo)
     build_on_fork(args, sync_first=True)
@@ -248,9 +422,9 @@ def cmd_mirror(args: argparse.Namespace) -> None:
     upload_upstream_assets(args)
 
 
-def validate_fork_repo(fork_repo: str | None) -> None:
+def validate_fork_repo(fork_repo: str | None) -> str:
     if fork_repo:
-        return
+        return fork_repo
     raise CommandError(
         "the fork repo is required; pass --fork-repo OWNER/REPO or set "
         "PLEXOS2DUCKDB_FORK_REPO"
@@ -299,7 +473,7 @@ def infer_repo_git_url(*, repo: str, fallback_url: str) -> str:
         user_host, _, _ = fallback_url.partition(":")
         return f"{user_host}:{repo}{suffix}"
 
-    parsed = urlparse(fallback_url)
+    parsed = urllib.parse.urlparse(fallback_url)
     if parsed.scheme and parsed.netloc:
         suffix = ".git" if parsed.path.endswith(".git") else ""
         return f"{parsed.scheme}://{parsed.netloc}/{repo}{suffix}"
@@ -351,14 +525,13 @@ def sync_fork_branch(
     combined_output = combine_output(result)
     if result.returncode == 0:
         if combined_output:
-            print(combined_output, flush=True)
+            show_message(combined_output)
         return
 
     if is_merge_upstream_not_supported(combined_output):
-        print(
+        show_message(
             "GitHub's merge-upstream API is unavailable for this repo; "
-            "falling back to git fetch/push sync.",
-            flush=True,
+            "falling back to git fetch/push sync."
         )
         sync_fork_branch_with_git(
             fork_repo=fork_repo,
@@ -390,52 +563,52 @@ def sync_fork_branch_with_git(
         cmd.append("--force")
     cmd.extend([fork_url, f"{source_ref}:refs/heads/{branch}"])
     run_command(cmd)
-    print(
-        f"Synchronized {fork_repo}:{branch} from {upstream_repo}:{branch} via git push.",
-        flush=True,
+    show_message(
+        f"Synchronized {fork_repo}:{branch} from {upstream_repo}:{branch} via git push."
     )
 
 
-def build_on_fork(args: argparse.Namespace, *, sync_first: bool) -> dict[str, Any]:
+def build_on_fork(args: ReleaseArguments, *, sync_first: bool) -> ReleaseJson:
+    fork_repo = validate_fork_repo(args.fork_repo)
+    tag = require_tag(args)
     if sync_first:
         sync_fork_branch(
-            fork_repo=args.fork_repo,
+            fork_repo=fork_repo,
             upstream_repo=args.upstream_repo,
             branch=args.branch,
             force_sync=args.force_sync,
         )
 
     release = ensure_fork_release(
-        fork_repo=args.fork_repo,
-        tag=args.tag,
+        fork_repo=fork_repo,
+        tag=tag,
         branch=args.branch,
     )
 
     asset_count = len(release.get("assets", []))
     if asset_count:
         if args.allow_existing_fork_assets:
-            print(
-                f"Fork release {args.tag} already has {asset_count} asset(s); "
-                "reusing them without dispatching the workflow.",
-                flush=True,
+            show_message(
+                f"Fork release {tag} already has {asset_count} asset(s); "
+                "reusing them without dispatching the workflow."
             )
             return release
         raise CommandError(
-            f"fork release {args.fork_repo}@{args.tag} already has {asset_count} asset(s). "
+            f"fork release {fork_repo}@{tag} already has {asset_count} asset(s). "
             "Use --allow-existing-fork-assets to reuse them, or clear the fork release assets first."
         )
 
     run_id = dispatch_workflow(
-        fork_repo=args.fork_repo,
+        fork_repo=fork_repo,
         workflow=args.workflow,
         workflow_ref=args.workflow_ref or args.branch,
-        tag=args.tag,
+        tag=tag,
     )
-    watch_workflow_run(fork_repo=args.fork_repo, run_id=run_id)
-    return wait_for_release_assets(repo=args.fork_repo, tag=args.tag)
+    watch_workflow_run(fork_repo=fork_repo, run_id=run_id)
+    return wait_for_release_assets(repo=fork_repo, tag=tag)
 
 
-def ensure_fork_release(*, fork_repo: str, tag: str, branch: str) -> dict[str, Any]:
+def ensure_fork_release(*, fork_repo: str, tag: str, branch: str) -> ReleaseJson:
     release = get_release(repo=fork_repo, tag=tag)
     if release is not None:
         return release
@@ -479,7 +652,7 @@ def dispatch_workflow(
         part for part in (result.stdout.strip(), result.stderr.strip()) if part
     )
     if combined_output:
-        print(combined_output, flush=True)
+        show_message(combined_output)
 
     run_id = parse_run_id_from_text(combined_output)
     if run_id is not None:
@@ -556,15 +729,15 @@ def watch_workflow_run(*, fork_repo: str, run_id: int) -> None:
     )
 
 
-def wait_for_release_assets(*, repo: str, tag: str) -> dict[str, Any]:
+def wait_for_release_assets(*, repo: str, tag: str) -> ReleaseJson:
     deadline = time.monotonic() + RELEASE_ASSET_TIMEOUT_SECONDS
-    last_release: dict[str, Any] | None = None
+    last_release: ReleaseJson | None = None
 
     while time.monotonic() < deadline:
         last_release = get_release(repo=repo, tag=tag)
         if last_release and last_release.get("assets"):
             asset_count = len(last_release["assets"])
-            print(f"Release {repo}@{tag} has {asset_count} asset(s).", flush=True)
+            show_message(f"Release {repo}@{tag} has {asset_count} asset(s).")
             return last_release
         time.sleep(POLL_INTERVAL_SECONDS)
 
@@ -574,35 +747,38 @@ def wait_for_release_assets(*, repo: str, tag: str) -> dict[str, Any]:
     )
 
 
-def download_fork_assets(args: argparse.Namespace) -> None:
-    release = wait_for_release_assets(repo=args.fork_repo, tag=args.tag)
+def download_fork_assets(args: ReleaseArguments) -> None:
+    fork_repo = validate_fork_repo(args.fork_repo)
+    tag = require_tag(args)
+    release = wait_for_release_assets(repo=fork_repo, tag=tag)
     asset_count = len(release["assets"])
-    download_dir = resolve_download_dir(args.tag, getattr(args, "download_dir", None))
+    download_dir = resolve_download_dir(tag, args.download_dir)
     download_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         "gh",
         "release",
         "download",
-        args.tag,
+        tag,
         "--repo",
-        args.fork_repo,
+        fork_repo,
         "--dir",
         str(download_dir),
     ]
-    if getattr(args, "clobber", False):
+    if args.clobber:
         cmd.append("--clobber")
     else:
         cmd.append("--skip-existing")
     run_command(cmd)
-    print(
-        f"Downloaded {asset_count} asset(s) from {args.fork_repo}@{args.tag} into {download_dir}.",
-        flush=True,
+    show_message(
+        f"Downloaded {asset_count} asset(s) from {fork_repo}@{tag} into {download_dir}."
     )
 
 
-def upload_upstream_assets(args: argparse.Namespace) -> None:
-    download_dir = resolve_download_dir(args.tag, getattr(args, "download_dir", None))
+def upload_upstream_assets(args: ReleaseArguments) -> None:
+    fork_repo = validate_fork_repo(args.fork_repo)
+    tag = require_tag(args)
+    download_dir = resolve_download_dir(tag, args.download_dir)
     asset_files = (
         sorted(path for path in download_dir.iterdir() if path.is_file())
         if download_dir.is_dir()
@@ -613,10 +789,10 @@ def upload_upstream_assets(args: argparse.Namespace) -> None:
             f"no files were found in {download_dir}; run download-fork-assets first"
         )
 
-    fork_release = wait_for_release_assets(repo=args.fork_repo, tag=args.tag)
+    fork_release = wait_for_release_assets(repo=fork_repo, tag=tag)
     ensure_upstream_release(
         upstream_repo=args.upstream_repo,
-        tag=args.tag,
+        tag=tag,
         branch=args.branch,
         fork_release=fork_release,
     )
@@ -625,18 +801,17 @@ def upload_upstream_assets(args: argparse.Namespace) -> None:
         "gh",
         "release",
         "upload",
-        args.tag,
+        tag,
         "--repo",
         args.upstream_repo,
     ]
-    if getattr(args, "clobber", False):
+    if args.clobber:
         cmd.append("--clobber")
     cmd.extend(str(path) for path in asset_files)
     run_command(cmd)
-    print(
+    show_message(
         f"Uploaded {len(asset_files)} asset(s) from {download_dir} to "
-        f"{args.upstream_repo}@{args.tag}.",
-        flush=True,
+        f"{args.upstream_repo}@{tag}."
     )
 
 
@@ -645,8 +820,8 @@ def ensure_upstream_release(
     upstream_repo: str,
     tag: str,
     branch: str,
-    fork_release: dict[str, Any],
-) -> dict[str, Any]:
+    fork_release: ReleaseJson,
+) -> ReleaseJson:
     release = get_release(repo=upstream_repo, tag=tag)
     if release is not None:
         return release
@@ -695,16 +870,16 @@ def create_release(
     run_command(cmd)
 
 
-def resolve_download_dir(tag: str, override: str | None) -> Path:
+def resolve_download_dir(tag: str, override: str | None) -> pathlib.Path:
     template = (
         override
         or os.environ.get("PLEXOS2DUCKDB_RELEASE_DOWNLOAD_DIR")
         or DEFAULT_DOWNLOAD_DIR_TEMPLATE
     )
-    return Path(template.format(tag=tag)).expanduser()
+    return pathlib.Path(template.format(tag=tag)).expanduser()
 
 
-def get_release(*, repo: str, tag: str) -> dict[str, Any] | None:
+def get_release(*, repo: str, tag: str) -> ReleaseJson | None:
     cmd = [
         "gh",
         "release",
@@ -724,7 +899,7 @@ def get_release(*, repo: str, tag: str) -> dict[str, Any] | None:
     return json.loads(result.stdout)
 
 
-def gh_json(args: list[str]) -> Any:
+def gh_json(args: list[str]) -> typing.Any:
     result = run_command(["gh", *args], capture=True)
     return json.loads(result.stdout)
 
@@ -741,7 +916,7 @@ def run_command(
     announce: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     if announce:
-        print("+", " ".join(shlex.quote(part) for part in cmd), flush=True)
+        show_command(cmd)
     result = subprocess.run(
         cmd,
         check=False,
