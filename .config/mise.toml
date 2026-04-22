@@ -25,7 +25,7 @@ fi
 '''
 
 [tasks."plexos2duckdb:test"]
-description = "Run the Rust test suite"
+description = "Run the Rust test suite after step 0 toolchain setup"
 depends = ["plexos2duckdb:download-test-data"]
 run = "cargo test"
 
@@ -35,7 +35,7 @@ interactive = true
 run = "uv run --with ipython --with-editable . ipython"
 
 [tasks."plexos2duckdb:release-sync-fork"]
-description = "Sync the configured fork branch from upstream"
+description = "Step 1 of 4 (manual release): sync the configured fork branch from upstream"
 shell = "bash -c"
 dir = "{{ config_root }}"
 usage = '''
@@ -55,7 +55,7 @@ if [[ "${usage_force_sync:-false}" == "true" ]]; then cmd+=(--force-sync); fi
 '''
 
 [tasks."plexos2duckdb:release-build-on-fork"]
-description = "Create or reuse the fork release, dispatch the workflow, and wait for assets"
+description = "Step 2 of 4 (manual release): build assets on the fork and wait for them"
 shell = "bash -c"
 dir = "{{ config_root }}"
 usage = '''
@@ -84,7 +84,7 @@ if [[ "${usage_skip_sync:-false}" == "true" ]]; then cmd+=(--skip-sync); fi
 '''
 
 [tasks."plexos2duckdb:release-download-fork-assets"]
-description = "Download release assets from the fork release"
+description = "Step 3 of 4 (manual release): download release assets from the fork release"
 shell = "bash -c"
 dir = "{{ config_root }}"
 usage = '''
@@ -103,7 +103,7 @@ if [[ "${usage_clobber:-false}" == "true" ]]; then cmd+=(--clobber); fi
 '''
 
 [tasks."plexos2duckdb:release-upload-upstream-assets"]
-description = "Upload downloaded release assets to the upstream release"
+description = "Step 4 of 4 (manual release): upload downloaded assets to the upstream release"
 shell = "bash -c"
 dir = "{{ config_root }}"
 usage = '''
