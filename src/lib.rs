@@ -372,9 +372,41 @@ impl ZipPeriodData {
 }
 
 #[derive(Debug)]
+struct BufferedPeriodData {
+    bytes: Arc<[u8]>,
+}
+
+impl BufferedPeriodData {
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let start = usize::try_from(offset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "period data read offset exceeds usize",
+            )
+        })?;
+        let end = start.checked_add(buf.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "period data read offset overflow",
+            )
+        })?;
+
+        let slice = self.bytes.get(start..end).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "period data read exceeds buffered entry bounds",
+            )
+        })?;
+        buf.copy_from_slice(slice);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 enum PeriodData {
     File(std::fs::File),
     ZipEntry(ZipPeriodData),
+    Buffered(BufferedPeriodData),
 }
 
 impl PeriodData {
@@ -382,6 +414,7 @@ impl PeriodData {
         match self {
             Self::File(file) => SolutionDataset::read_exact_at(file, offset, buf),
             Self::ZipEntry(entry) => entry.read_exact_at(offset, buf),
+            Self::Buffered(entry) => entry.read_exact_at(offset, buf),
         }
     }
 }
@@ -776,26 +809,41 @@ impl SolutionDataset {
 
         let archive_len = archive.len();
         for i in 0..archive_len {
-            let file = archive.by_index(i)?;
+            let mut file = archive.by_index(i)?;
             let name = file.name().to_string();
 
             if let Some(digit) = Self::is_valid_bin_filename(&name) {
-                if file.compression() != zip::CompressionMethod::Stored {
-                    return Err(eyre!(
-                        "BIN file '{}' is compressed; direct ZIP reads require stored entries",
-                        name
-                    ));
+                if file.compression() == zip::CompressionMethod::Stored {
+                    let data_start = file.data_start().ok_or_else(|| {
+                        eyre!("ZIP entry '{}' is missing a data start offset", name)
+                    })?;
+                    let entry = ZipPeriodData {
+                        archive_file: archive_file.clone(),
+                        data_start,
+                        data_len: file.size(),
+                    };
+                    period_data.insert(digit, PeriodData::ZipEntry(entry));
+                    continue;
                 }
 
-                let data_start = file
-                    .data_start()
-                    .ok_or_else(|| eyre!("ZIP entry '{}' is missing a data start offset", name))?;
-                let entry = ZipPeriodData {
-                    archive_file: archive_file.clone(),
-                    data_start,
-                    data_len: file.size(),
+                let data_len = usize::try_from(file.size()).map_err(|_| {
+                    eyre!(
+                        "BIN file '{}' is too large to buffer in memory on this platform",
+                        name
+                    )
+                })?;
+                let mut bytes = vec![0u8; data_len];
+                file.read_exact(&mut bytes).map_err(|err| {
+                    eyre!(
+                        "Failed decompressing BIN file '{}' from ZIP archive: {}",
+                        name,
+                        err
+                    )
+                })?;
+                let entry = BufferedPeriodData {
+                    bytes: Arc::<[u8]>::from(bytes),
                 };
-                period_data.insert(digit, PeriodData::ZipEntry(entry));
+                period_data.insert(digit, PeriodData::Buffered(entry));
             }
         }
 
