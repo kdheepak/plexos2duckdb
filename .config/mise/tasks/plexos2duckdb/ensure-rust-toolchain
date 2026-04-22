@@ -1,26 +1,47 @@
 #!/usr/bin/env -S uv run --script
-# [MISE] description="Install Rust toolchain components and optional targets via rustup"
+# [MISE] dir="{{cwd}}"
+# [MISE] description="Step 0: install Rust toolchain components before building or testing"
+# [MISE] quiet=true
+# [MISE] raw=true
 # [USAGE] about "Install Rust toolchain components and optional targets via rustup"
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.14"
+# dependencies = [
+#   "cyclopts>=4.10.2",
+#   "rich>=14.1.0",
+# ]
 # ///
-
-from __future__ import annotations
 
 import os
 import shlex
 import subprocess
 
+import cyclopts
+import rich.console
+
 DEFAULT_PROFILE = "default"
 DEFAULT_COMPONENTS = ("clippy", "rustfmt", "llvm-tools")
+
+app = cyclopts.App(
+    help=(
+        "Step 0 for a new machine: install Rust toolchain components and optional "
+        "targets via rustup before running build, test, or release tasks."
+    )
+)
+stdout_console = rich.console.Console()
+stderr_console = rich.console.Console(stderr=True)
 
 
 def split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def show_message(message: str) -> None:
+    stdout_console.print(message, markup=False)
+
+
 def run(cmd: list[str]) -> None:
-    print("+", " ".join(shlex.quote(part) for part in cmd), flush=True)
+    show_message(f"+ {' '.join(shlex.quote(part) for part in cmd)}")
     subprocess.run(cmd, check=True)
 
 
@@ -41,20 +62,32 @@ def resolve_toolchain() -> str:
     raise RuntimeError("unable to determine active Rust toolchain")
 
 
-def main() -> int:
+@app.default
+def install() -> None:
     toolchain = resolve_toolchain()
-    profile = DEFAULT_PROFILE
-    components = list(DEFAULT_COMPONENTS)
     targets = split_csv(os.environ.get("RUST_TOOLCHAIN_TARGETS", ""))
 
-    run(["rustup", "toolchain", "install", toolchain, "--profile", profile])
-
-    if components:
-        run(["rustup", "component", "add", f"--toolchain={toolchain}", *components])
+    run(["rustup", "toolchain", "install", toolchain, "--profile", DEFAULT_PROFILE])
+    run(
+        [
+            "rustup",
+            "component",
+            "add",
+            f"--toolchain={toolchain}",
+            *DEFAULT_COMPONENTS,
+        ]
+    )
 
     if targets:
         run(["rustup", "target", "add", f"--toolchain={toolchain}", *targets])
 
+
+def main() -> int:
+    try:
+        app()
+    except Exception as exc:
+        stderr_console.print(f"[red]Error:[/red] {exc}")
+        return 1
     return 0
 
 
