@@ -3600,6 +3600,7 @@ impl SolutionDataset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     fn build_small_database(mode: DbWriteMode) -> Result<(tempfile::TempDir, std::path::PathBuf)> {
         let output_dir = tempfile::TempDir::new()?;
@@ -3655,6 +3656,43 @@ mod tests {
     fn persist_direct_mode_uses_copy_and_checkpoint() -> Result<()> {
         let (_output_dir, db_path) = build_small_database(DbWriteMode::Direct)?;
         assert_small_database(&db_path)
+    }
+
+    #[test]
+    fn read_zip_archive_buffers_deflated_bin_entries() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let zip_path = temp_dir.path().join("Model_Base_Solution.zip");
+
+        let zip_file = std::fs::File::create(&zip_path)?;
+        let mut zip_writer = zip::ZipWriter::new(zip_file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        zip_writer.start_file("Model Base Solution.xml", options)?;
+        zip_writer.write_all(b"<root />")?;
+
+        zip_writer.start_file("t_data_0.BIN", options)?;
+        let expected = [1.25_f64, 2.5_f64];
+        for value in expected {
+            zip_writer.write_all(&value.to_le_bytes())?;
+        }
+        zip_writer.finish()?;
+
+        let (_xml_content, period_data) =
+            SolutionDataset::read_zip_archive(&zip_path, "", &mut None)?;
+        let data = period_data
+            .get(&0)
+            .ok_or_else(|| eyre!("expected period data for digit 0"))?;
+
+        let mut actual = [0u8; 16];
+        data.read_exact_at(0, &mut actual)?;
+
+        let first = f64::from_le_bytes(actual[0..8].try_into().expect("slice length matches"));
+        let second = f64::from_le_bytes(actual[8..16].try_into().expect("slice length matches"));
+
+        assert_eq!(first, 1.25);
+        assert_eq!(second, 2.5);
+        Ok(())
     }
 }
 
