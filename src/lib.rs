@@ -2,12 +2,36 @@
 #![doc = include_str!("../README.md")]
 
 use std::io::Read as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use color_eyre::{Result, eyre::eyre};
+use duckdb::arrow::{
+    array::{ArrayRef, Float64Array, Int64Array},
+    datatypes::{DataType, Field, Schema, SchemaRef},
+    record_batch::RecordBatch,
+};
 use roxmltree::{Document, Node};
 
+mod deflate_index;
 pub mod utils;
+
+pub const DEFAULT_DEFLATE_INDEX_INTERVAL_MIB: u64 = 64;
+
+const DATA_APPEND_BATCH_VALUES: u64 = 262_144;
+const DATA_RANGE_TASK_VALUES: u64 = 8_388_608;
+const MIB_BYTES: u64 = 1024 * 1024;
+const MIN_DEFLATE_INDEX_INTERVAL_BYTES: u64 = MIB_BYTES;
+
+static DATA_RECORD_BATCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("key_id", DataType::Int64, false),
+        Field::new("sample_id", DataType::Int64, false),
+        Field::new("band_id", DataType::Int64, false),
+        Field::new("membership_id", DataType::Int64, false),
+        Field::new("block_id", DataType::Int64, false),
+        Field::new("value", DataType::Float64, false),
+    ]))
+});
 
 #[derive(Debug, Default, Clone)]
 struct Unit {
@@ -371,33 +395,289 @@ impl ZipPeriodData {
     }
 }
 
-#[derive(Debug)]
-struct BufferedPeriodData {
-    bytes: Arc<[u8]>,
+#[derive(Debug, Clone)]
+struct ZipMemberReader {
+    archive_file: Arc<std::fs::File>,
+    data_start: u64,
+    compressed_len: u64,
+    position: u64,
 }
 
-impl BufferedPeriodData {
-    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        let start = usize::try_from(offset).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "period data read offset exceeds usize",
-            )
-        })?;
-        let end = start.checked_add(buf.len()).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "period data read offset overflow",
-            )
-        })?;
+impl ZipMemberReader {
+    fn new(archive_file: Arc<std::fs::File>, data_start: u64, compressed_len: u64) -> Self {
+        Self {
+            archive_file,
+            data_start,
+            compressed_len,
+            position: 0,
+        }
+    }
+}
 
-        let slice = self.bytes.get(start..end).ok_or_else(|| {
+impl std::io::Read for ZipMemberReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.position >= self.compressed_len {
+            return Ok(0);
+        }
+
+        let remaining = self.compressed_len - self.position;
+        let read_len = remaining.min(buf.len() as u64) as usize;
+        let archive_offset = self.data_start.checked_add(self.position).ok_or_else(|| {
             std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "period data read exceeds buffered entry bounds",
+                std::io::ErrorKind::InvalidInput,
+                "archive read offset overflow",
             )
         })?;
-        buf.copy_from_slice(slice);
+        SolutionDataset::read_exact_at(&self.archive_file, archive_offset, &mut buf[..read_len])?;
+        self.position = self.position.checked_add(read_len as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ZIP member position overflow",
+            )
+        })?;
+        Ok(read_len)
+    }
+}
+
+impl std::io::Seek for ZipMemberReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let next = match pos {
+            std::io::SeekFrom::Start(offset) => i128::from(offset),
+            std::io::SeekFrom::End(offset) => i128::from(self.compressed_len) + i128::from(offset),
+            std::io::SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+        };
+
+        if next < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot seek before ZIP member start",
+            ));
+        }
+
+        self.position = u64::try_from(next).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ZIP member seek offset exceeds u64",
+            )
+        })?;
+        Ok(self.position)
+    }
+}
+
+#[derive(Debug)]
+struct CompressedZipPeriodData {
+    archive_file: Arc<std::fs::File>,
+    data_start: u64,
+    compressed_len: u64,
+    data_len: u64,
+    name: String,
+}
+
+impl CompressedZipPeriodData {
+    fn compressed_reader(&self) -> ZipMemberReader {
+        ZipMemberReader::new(
+            self.archive_file.clone(),
+            self.data_start,
+            self.compressed_len,
+        )
+    }
+
+    fn build_deflate_index(&self, interval_bytes: u64) -> Result<CompressedDeflateIndex> {
+        let interval_bytes = interval_bytes.max(MIN_DEFLATE_INDEX_INTERVAL_BYTES);
+        let index = deflate_index::DeflateIndex::build(
+            self.compressed_reader(),
+            self.data_len,
+            interval_bytes,
+        )?;
+        Ok(CompressedDeflateIndex { index })
+    }
+
+    fn read_exact_at_with_index(
+        &self,
+        index: &CompressedDeflateIndex,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        index
+            .index
+            .read_exact_at(self.compressed_reader(), offset, buf)?;
+        Ok(())
+    }
+
+    fn indexed_reader<'a>(
+        &self,
+        index: &'a CompressedDeflateIndex,
+        offset: u64,
+    ) -> std::io::Result<deflate_index::DeflateIndexedReader<'a, ZipMemberReader>> {
+        index.index.indexed_reader(self.compressed_reader(), offset)
+    }
+
+    fn read_exact_at(&self, _offset: u64, _buf: &mut [u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "compressed ZIP period data requires a deflate seek index",
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompressedDeflateIndex {
+    index: deflate_index::DeflateIndex,
+}
+
+#[derive(Debug)]
+struct CompressedDeflateIndexes {
+    by_period_type_id: DeflateIndexMap,
+}
+
+impl CompressedDeflateIndexes {
+    fn get(&self, period_type_id: i64) -> Option<&CompressedDeflateIndex> {
+        self.by_period_type_id
+            .get(&period_type_id)
+            .map(std::convert::AsRef::as_ref)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DataRangeWriteTask {
+    table_name: String,
+    key_id: i64,
+    sample_id: i64,
+    band_id: i64,
+    membership_id: i64,
+    period_type_id: i64,
+    position: u64,
+    start_value_index: u64,
+    value_count: u64,
+    period_offset: i64,
+}
+
+#[derive(Debug)]
+struct StagedRangeDataShard {
+    db_path: std::path::PathBuf,
+    table_names: Vec<String>,
+}
+
+#[derive(Debug)]
+enum DataRangeWriteWorkerEvent {
+    RangeStarted {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+        table_name: String,
+        key_id: i64,
+        start_value: u64,
+        values: u64,
+    },
+    RangeCompleted {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DataValueMetadata {
+    key_id: i64,
+    sample_id: i64,
+    band_id: i64,
+    membership_id: i64,
+    period_offset: i64,
+    start_value_index: u64,
+}
+
+impl DataValueMetadata {
+    fn block_id(&self, chunk_index: usize) -> Result<i64> {
+        let chunk_index = u64::try_from(chunk_index).map_err(|_| {
+            eyre!(
+                "block_id chunk index exceeds u64 for key_id {}",
+                self.key_id
+            )
+        })?;
+        let block_idx = self
+            .start_value_index
+            .checked_add(chunk_index)
+            .ok_or_else(|| eyre!("block_id overflow for key_id {}", self.key_id))?;
+        i64::try_from(block_idx)
+            .map_err(|_| eyre!("block_id exceeds i64 for key_id {}", self.key_id))?
+            .checked_add(self.period_offset)
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| eyre!("block_id overflow for key_id {}", self.key_id))
+    }
+}
+
+impl PeriodData {
+    fn is_compressed_zip_entry(&self) -> bool {
+        matches!(self, Self::CompressedZipEntry(_))
+    }
+
+    fn compressed_zip_entry(&self) -> Option<&CompressedZipPeriodData> {
+        match self {
+            Self::CompressedZipEntry(entry) => Some(entry),
+            _ => None,
+        }
+    }
+}
+
+type DeflateIndexMap = std::collections::HashMap<i64, Arc<CompressedDeflateIndex>>;
+
+impl DataRangeWriteTask {
+    fn estimated_values(&self) -> u128 {
+        u128::from(self.value_count)
+    }
+}
+
+impl StagedRangeDataShard {
+    fn new(db_path: std::path::PathBuf, table_names: Vec<String>) -> Self {
+        Self {
+            db_path,
+            table_names,
+        }
+    }
+}
+
+impl DataRangeWriteWorkerEvent {
+    fn completed(worker_id: usize, index: usize, total: usize) -> Self {
+        Self::RangeCompleted {
+            worker_id,
+            index,
+            total,
+        }
+    }
+}
+
+impl DataValueMetadata {
+    fn append_record_batch(&self, appender: &mut duckdb::Appender<'_>, bytes: &[u8]) -> Result<()> {
+        if bytes.len() % 8 != 0 {
+            return Err(eyre!(
+                "Data chunk byte length is not a multiple of f64 width for key_id {}",
+                self.key_id
+            ));
+        }
+
+        let value_count = bytes.len() / 8;
+        let mut values = Vec::with_capacity(value_count);
+        for chunk in bytes.chunks_exact(8) {
+            values.push(f64::from_le_bytes(
+                chunk.try_into().expect("chunks_exact gives eight bytes"),
+            ));
+        }
+
+        let mut block_ids = Vec::with_capacity(value_count);
+        for idx in 0..value_count {
+            block_ids.push(self.block_id(idx)?);
+        }
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![self.key_id; value_count])),
+            Arc::new(Int64Array::from(vec![self.sample_id; value_count])),
+            Arc::new(Int64Array::from(vec![self.band_id; value_count])),
+            Arc::new(Int64Array::from(vec![self.membership_id; value_count])),
+            Arc::new(Int64Array::from(block_ids)),
+            Arc::new(Float64Array::from(values)),
+        ];
+        let record_batch = RecordBatch::try_new(DATA_RECORD_BATCH_SCHEMA.clone(), columns)?;
+        appender.append_record_batch(record_batch)?;
         Ok(())
     }
 }
@@ -406,7 +686,7 @@ impl BufferedPeriodData {
 enum PeriodData {
     File(std::fs::File),
     ZipEntry(ZipPeriodData),
-    Buffered(BufferedPeriodData),
+    CompressedZipEntry(CompressedZipPeriodData),
 }
 
 impl PeriodData {
@@ -414,7 +694,7 @@ impl PeriodData {
         match self {
             Self::File(file) => SolutionDataset::read_exact_at(file, offset, buf),
             Self::ZipEntry(entry) => entry.read_exact_at(offset, buf),
-            Self::Buffered(entry) => entry.read_exact_at(offset, buf),
+            Self::CompressedZipEntry(entry) => entry.read_exact_at(offset, buf),
         }
     }
 }
@@ -472,6 +752,20 @@ pub enum ProgressEvent {
         keys: usize,
     },
     DataWorkerTableEnd {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+    },
+    DataWorkerRangeStart {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+        table_name: String,
+        key_id: i64,
+        start_value: u64,
+        values: u64,
+    },
+    DataWorkerRangeEnd {
         worker_id: usize,
         index: usize,
         total: usize,
@@ -534,6 +828,7 @@ pub struct DuckdbBuilder<'a> {
     db_path: std::path::PathBuf,
     mode: DbWriteMode,
     data_write_threads: Option<usize>,
+    deflate_index_interval_bytes: u64,
     report: Option<&'a mut dyn FnMut(&str)>,
     progress: Option<&'a mut dyn FnMut(ProgressEvent)>,
 }
@@ -545,6 +840,7 @@ impl<'a> DuckdbBuilder<'a> {
             db_path: db_path.as_ref().to_path_buf(),
             mode: DbWriteMode::InMemoryThenCopy,
             data_write_threads: None,
+            deflate_index_interval_bytes: DEFAULT_DEFLATE_INDEX_INTERVAL_MIB * MIB_BYTES,
             report: None,
             progress: None,
         }
@@ -557,6 +853,11 @@ impl<'a> DuckdbBuilder<'a> {
 
     pub fn with_data_write_threads(mut self, threads: usize) -> Self {
         self.data_write_threads = Some(threads.max(1));
+        self
+    }
+
+    pub fn with_deflate_index_interval_bytes(mut self, bytes: u64) -> Self {
+        self.deflate_index_interval_bytes = bytes.max(MIN_DEFLATE_INDEX_INTERVAL_BYTES);
         self
     }
 
@@ -596,6 +897,7 @@ impl<'a> DuckdbBuilder<'a> {
             combined_opt,
             self.mode,
             self.data_write_threads,
+            self.deflate_index_interval_bytes,
         )
     }
 }
@@ -809,7 +1111,7 @@ impl SolutionDataset {
 
         let archive_len = archive.len();
         for i in 0..archive_len {
-            let mut file = archive.by_index(i)?;
+            let file = archive.by_index(i)?;
             let name = file.name().to_string();
 
             if let Some(digit) = Self::is_valid_bin_filename(&name) {
@@ -826,24 +1128,25 @@ impl SolutionDataset {
                     continue;
                 }
 
-                let data_len = usize::try_from(file.size()).map_err(|_| {
-                    eyre!(
-                        "BIN file '{}' is too large to buffer in memory on this platform",
-                        name
-                    )
-                })?;
-                let mut bytes = vec![0u8; data_len];
-                file.read_exact(&mut bytes).map_err(|err| {
-                    eyre!(
-                        "Failed decompressing BIN file '{}' from ZIP archive: {}",
+                if file.compression() != zip::CompressionMethod::Deflated {
+                    return Err(eyre!(
+                        "BIN file '{}' uses unsupported ZIP compression method {:?}; only stored and deflated BIN entries can be converted without buffering",
                         name,
-                        err
-                    )
-                })?;
-                let entry = BufferedPeriodData {
-                    bytes: Arc::<[u8]>::from(bytes),
+                        file.compression()
+                    ));
+                }
+
+                let data_start = file
+                    .data_start()
+                    .ok_or_else(|| eyre!("ZIP entry '{}' is missing a data start offset", name))?;
+                let entry = CompressedZipPeriodData {
+                    archive_file: archive_file.clone(),
+                    data_start,
+                    compressed_len: file.compressed_size(),
+                    data_len: file.size(),
+                    name,
                 };
-                period_data.insert(digit, PeriodData::Buffered(entry));
+                period_data.insert(digit, PeriodData::CompressedZipEntry(entry));
             }
         }
 
@@ -1762,6 +2065,7 @@ impl SolutionDataset {
         mut progress: Option<&mut dyn FnMut(DuckdbProgress)>,
         mode: DbWriteMode,
         data_write_threads: Option<usize>,
+        deflate_index_interval_bytes: u64,
     ) -> Result<()> {
         let db_path = db_path.as_ref();
         let total_steps = 28;
@@ -1980,7 +2284,15 @@ impl SolutionDataset {
             &mut step_index,
             total_steps,
             "Writing time series data",
-            |progress| self.populate_table_data(&mut con, progress, data_write_threads),
+            |progress| {
+                self.populate_table_data(
+                    &mut con,
+                    progress,
+                    data_write_threads,
+                    db_path,
+                    deflate_index_interval_bytes,
+                )
+            },
         )?;
 
         Self::report_duckdb_progress(&mut progress, "Creating processed views");
@@ -2026,6 +2338,8 @@ impl SolutionDataset {
         con: &mut duckdb::Connection,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
         data_write_threads: Option<usize>,
+        db_path: &std::path::Path,
+        deflate_index_interval_bytes: u64,
     ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS data;")?;
 
@@ -2035,11 +2349,30 @@ impl SolutionDataset {
             return Ok(());
         }
 
+        let staging_parent = Self::duckdb_staging_parent(db_path);
         let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
+        if self.has_compressed_period_data() {
+            let range_worker_count = Self::resolve_data_range_write_threads(data_write_threads);
+            return self.populate_table_data_indexed_ranges(
+                con,
+                plans,
+                range_worker_count,
+                staging_parent.as_path(),
+                deflate_index_interval_bytes,
+                progress,
+            );
+        }
+
         if worker_count <= 1 {
             return self.populate_table_data_sequential(con, plans, progress);
         }
-        self.populate_table_data_parallel(con, plans, worker_count, progress)
+        self.populate_table_data_parallel(
+            con,
+            plans,
+            worker_count,
+            staging_parent.as_path(),
+            progress,
+        )
     }
 
     fn build_data_table_plans(&self) -> Result<Vec<DataTableWritePlan>> {
@@ -2087,6 +2420,24 @@ impl SolutionDataset {
         }
     }
 
+    fn resolve_data_range_write_threads(configured_threads: Option<usize>) -> usize {
+        const MAX_AUTO_DATA_RANGE_WRITE_THREADS: usize = 16;
+
+        match configured_threads {
+            Some(threads) => threads.max(1),
+            None => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(MAX_AUTO_DATA_RANGE_WRITE_THREADS),
+        }
+    }
+
+    fn has_compressed_period_data(&self) -> bool {
+        self.period_data
+            .values()
+            .any(PeriodData::is_compressed_zip_entry)
+    }
+
     fn populate_table_data_sequential(
         &self,
         con: &mut duckdb::Connection,
@@ -2120,12 +2471,15 @@ impl SolutionDataset {
         con: &mut duckdb::Connection,
         plans: Vec<DataTableWritePlan>,
         worker_count: usize,
+        staging_parent: &std::path::Path,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
         let total_tables = plans.len();
         let worker_plans = Self::distribute_data_table_plans(plans, worker_count);
 
-        let staging_dir = tempfile::TempDir::new()?;
+        let staging_dir = tempfile::Builder::new()
+            .prefix("plexos2duckdb-data-shards-")
+            .tempdir_in(staging_parent)?;
         let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
         let staged_shards = std::thread::scope(|scope| -> Result<Vec<StagedDataShard>> {
             let mut handles = Vec::with_capacity(worker_plans.len());
@@ -2266,6 +2620,484 @@ impl SolutionDataset {
         worker_plans
     }
 
+    fn populate_table_data_indexed_ranges(
+        &self,
+        con: &mut duckdb::Connection,
+        plans: Vec<DataTableWritePlan>,
+        worker_count: usize,
+        staging_parent: &std::path::Path,
+        deflate_index_interval_bytes: u64,
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
+        let compressed_indexes = self.build_compressed_period_data_indexes(
+            staging_parent,
+            deflate_index_interval_bytes,
+            progress,
+        )?;
+        let tasks = self.build_data_range_write_tasks(&plans)?;
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        for plan in &plans {
+            self.create_data_table(con, plan.table_name.as_str())?;
+        }
+
+        let worker_count = worker_count.min(tasks.len()).max(1);
+        let total_ranges = tasks.len();
+        let worker_tasks = Self::distribute_data_range_write_tasks(tasks, worker_count);
+        Self::report_duckdb_progress(
+            progress,
+            &format!(
+                "Writing indexed compressed BIN ranges with {} shard workers",
+                worker_tasks.len()
+            ),
+        );
+
+        let staging_dir = tempfile::Builder::new()
+            .prefix("plexos2duckdb-range-shards-")
+            .tempdir_in(staging_parent)?;
+        let (tx, rx) = std::sync::mpsc::channel::<DataRangeWriteWorkerEvent>();
+        let staged_shards = std::thread::scope(|scope| -> Result<Vec<StagedRangeDataShard>> {
+            let mut handles = Vec::with_capacity(worker_tasks.len());
+            for (worker_idx, worker_task_list) in worker_tasks.into_iter().enumerate() {
+                let shard_path = staging_dir
+                    .path()
+                    .join(format!("data_range_stage_{worker_idx}.duckdb"));
+                let worker_tx = tx.clone();
+                let compressed_indexes = &compressed_indexes;
+
+                handles.push(scope.spawn(move || -> Result<StagedRangeDataShard> {
+                    let mut worker_con = duckdb::Connection::open(&shard_path)?;
+                    worker_con.execute_batch(
+                        "SET preserve_insertion_order = false; CREATE SCHEMA IF NOT EXISTS data;",
+                    )?;
+
+                    let worker_total = worker_task_list.len();
+                    let mut created_tables = std::collections::BTreeSet::<String>::new();
+                    for (task_idx, task) in worker_task_list.into_iter().enumerate() {
+                        let worker_task_index = task_idx + 1;
+                        if created_tables.insert(task.table_name.clone()) {
+                            self.create_data_table(&mut worker_con, task.table_name.as_str())?;
+                        }
+
+                        let _ = worker_tx.send(DataRangeWriteWorkerEvent::RangeStarted {
+                            worker_id: worker_idx,
+                            index: worker_task_index,
+                            total: worker_total,
+                            table_name: task.table_name.clone(),
+                            key_id: task.key_id,
+                            start_value: task.start_value_index,
+                            values: task.value_count,
+                        });
+
+                        {
+                            let mut appender =
+                                worker_con.appender_to_db(task.table_name.as_str(), "data")?;
+                            self.append_data_range_task(&mut appender, &task, compressed_indexes)?;
+                            appender.flush()?;
+                        }
+
+                        let _ = worker_tx.send(DataRangeWriteWorkerEvent::completed(
+                            worker_idx,
+                            worker_task_index,
+                            worker_total,
+                        ));
+                    }
+
+                    Ok(StagedRangeDataShard::new(
+                        shard_path,
+                        created_tables.into_iter().collect(),
+                    ))
+                }));
+            }
+            drop(tx);
+
+            let mut completed_ranges = 0usize;
+            while completed_ranges < total_ranges {
+                let event = rx.recv().map_err(|_| {
+                    eyre!(
+                        "Range worker progress channel closed before all ranges completed ({}/{})",
+                        completed_ranges,
+                        total_ranges
+                    )
+                })?;
+                match event {
+                    DataRangeWriteWorkerEvent::RangeStarted {
+                        worker_id,
+                        index,
+                        total,
+                        table_name,
+                        key_id,
+                        start_value,
+                        values,
+                    } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerRangeStart {
+                                worker_id,
+                                index,
+                                total,
+                                table_name,
+                                key_id,
+                                start_value,
+                                values,
+                            }));
+                        }
+                    },
+                    DataRangeWriteWorkerEvent::RangeCompleted {
+                        worker_id,
+                        index,
+                        total,
+                    } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerRangeEnd {
+                                worker_id,
+                                index,
+                                total,
+                            }));
+                        }
+                        completed_ranges += 1;
+                    },
+                }
+            }
+
+            let mut shards = Vec::with_capacity(handles.len());
+            Self::report_duckdb_progress(progress, "Finalizing indexed range shards");
+            for handle in handles {
+                let result = handle
+                    .join()
+                    .map_err(|_| eyre!("A range data writer thread panicked"))?;
+                shards.push(result?);
+            }
+            Ok(shards)
+        })?;
+
+        Self::report_duckdb_progress(progress, "Merging indexed range shards");
+        self.merge_staged_range_data_shards(con, &staged_shards, progress)?;
+        Ok(())
+    }
+
+    fn build_compressed_period_data_indexes(
+        &self,
+        _staging_parent: &std::path::Path,
+        interval_bytes: u64,
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<CompressedDeflateIndexes> {
+        let interval_bytes = interval_bytes.max(MIN_DEFLATE_INDEX_INTERVAL_BYTES);
+        let compressed_entries: Vec<_> = self
+            .period_data
+            .iter()
+            .filter_map(|(period_type_id, period_data)| {
+                period_data
+                    .compressed_zip_entry()
+                    .map(|entry| (*period_type_id, entry))
+            })
+            .collect();
+
+        let total_entries = compressed_entries.len();
+        let mut indexes = DeflateIndexMap::with_capacity(compressed_entries.len());
+        for (idx, (period_type_id, entry)) in compressed_entries.into_iter().enumerate() {
+            Self::report_duckdb_progress(
+                progress,
+                &format!(
+                    "Indexing {} ({}/{}, interval {} MiB)",
+                    entry.name,
+                    idx + 1,
+                    total_entries,
+                    interval_bytes / MIB_BYTES
+                ),
+            );
+            let index = entry
+                .build_deflate_index(interval_bytes)
+                .map_err(|err| eyre!("Failed indexing compressed BIN '{}': {}", entry.name, err))?;
+            let checkpoint_count = index.index.checkpoint_count();
+            let window_bytes = index.index.window_bytes();
+            Self::report_duckdb_progress(
+                progress,
+                &format!(
+                    "Indexed {} into {} deflate checkpoints ({:.1} MiB)",
+                    entry.name,
+                    checkpoint_count,
+                    window_bytes as f64 / MIB_BYTES as f64
+                ),
+            );
+            indexes.insert(period_type_id, Arc::new(index));
+        }
+
+        Ok(CompressedDeflateIndexes {
+            by_period_type_id: indexes,
+        })
+    }
+
+    fn build_data_range_write_tasks(
+        &self,
+        plans: &[DataTableWritePlan],
+    ) -> Result<Vec<DataRangeWriteTask>> {
+        let mut tasks = Vec::new();
+        for plan in plans {
+            for key_id in plan.key_ids.iter().copied() {
+                let ki = self.key_index(key_id)?;
+                let key = self.key(key_id)?;
+                if ki.position % 8 != 0 {
+                    return Err(eyre!(
+                        "BIN position misaligned for key_id {} (pos_bytes={})",
+                        key_id,
+                        ki.position
+                    ));
+                }
+
+                let mut start_value_index = 0u64;
+                while start_value_index < ki.length {
+                    let value_count = (ki.length - start_value_index).min(DATA_RANGE_TASK_VALUES);
+                    let byte_delta = start_value_index
+                        .checked_mul(8)
+                        .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
+                    let position = ki
+                        .position
+                        .checked_add(byte_delta)
+                        .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
+                    tasks.push(DataRangeWriteTask {
+                        table_name: plan.table_name.clone(),
+                        key_id,
+                        sample_id: key.sample_id,
+                        band_id: key.band_id,
+                        membership_id: key.membership_id,
+                        period_type_id: ki.period_type_id,
+                        position,
+                        start_value_index,
+                        value_count,
+                        period_offset: ki.period_offset,
+                    });
+                    start_value_index = start_value_index
+                        .checked_add(value_count)
+                        .ok_or_else(|| eyre!("Value index overflow for key_id {}", key_id))?;
+                }
+            }
+        }
+
+        tasks.sort_by(|a, b| {
+            b.estimated_values()
+                .cmp(&a.estimated_values())
+                .then_with(|| a.table_name.cmp(&b.table_name))
+                .then_with(|| a.key_id.cmp(&b.key_id))
+                .then_with(|| a.start_value_index.cmp(&b.start_value_index))
+        });
+        Ok(tasks)
+    }
+
+    fn distribute_data_range_write_tasks(
+        tasks: Vec<DataRangeWriteTask>,
+        worker_count: usize,
+    ) -> Vec<Vec<DataRangeWriteTask>> {
+        let mut worker_tasks = vec![Vec::<DataRangeWriteTask>::new(); worker_count];
+        let mut worker_loads = vec![0u128; worker_count];
+
+        for task in tasks {
+            let (worker_idx, _) = worker_loads
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, load)| **load)
+                .expect("worker_count must be non-zero");
+
+            worker_loads[worker_idx] =
+                worker_loads[worker_idx].saturating_add(task.estimated_values());
+            worker_tasks[worker_idx].push(task);
+        }
+
+        for tasks in &mut worker_tasks {
+            tasks.sort_by(|a, b| {
+                a.table_name
+                    .cmp(&b.table_name)
+                    .then_with(|| a.key_id.cmp(&b.key_id))
+                    .then_with(|| a.start_value_index.cmp(&b.start_value_index))
+            });
+        }
+        worker_tasks.retain(|tasks| !tasks.is_empty());
+        worker_tasks
+    }
+
+    fn append_data_range_task(
+        &self,
+        appender: &mut duckdb::Appender<'_>,
+        task: &DataRangeWriteTask,
+        compressed_indexes: &CompressedDeflateIndexes,
+    ) -> Result<()> {
+        let period_data = self
+            .period_data
+            .get(&task.period_type_id)
+            .ok_or_else(|| eyre!("period type not found: {}", task.period_type_id))?;
+
+        if let PeriodData::CompressedZipEntry(entry) = period_data {
+            return self.append_compressed_data_range_task(
+                appender,
+                task,
+                entry,
+                compressed_indexes,
+            );
+        }
+
+        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
+        let mut value_offset = 0u64;
+        while value_offset < task.value_count {
+            let chunk_values = (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
+            let chunk_bytes_u64 = chunk_values
+                .checked_mul(8)
+                .ok_or_else(|| eyre!("Chunk size overflow for key_id {}", task.key_id))?;
+            let chunk_bytes = usize::try_from(chunk_bytes_u64)
+                .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", task.key_id))?;
+            let offset_delta = value_offset
+                .checked_mul(8)
+                .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
+            let chunk_offset = task
+                .position
+                .checked_add(offset_delta)
+                .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
+
+            period_data
+                .read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes])
+                .map_err(|err| {
+                    eyre!(
+                        "Failed reading period data for key_id {} at byte offset {}: {}",
+                        task.key_id,
+                        chunk_offset,
+                        err
+                    )
+                })?;
+
+            let metadata = DataValueMetadata {
+                key_id: task.key_id,
+                sample_id: task.sample_id,
+                band_id: task.band_id,
+                membership_id: task.membership_id,
+                period_offset: task.period_offset,
+                start_value_index: task
+                    .start_value_index
+                    .checked_add(value_offset)
+                    .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?,
+            };
+            metadata.append_record_batch(appender, &chunk_buf[..chunk_bytes])?;
+            value_offset = value_offset
+                .checked_add(chunk_values)
+                .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
+        }
+
+        Ok(())
+    }
+
+    fn append_compressed_data_range_task(
+        &self,
+        appender: &mut duckdb::Appender<'_>,
+        task: &DataRangeWriteTask,
+        entry: &CompressedZipPeriodData,
+        compressed_indexes: &CompressedDeflateIndexes,
+    ) -> Result<()> {
+        let index = compressed_indexes.get(task.period_type_id).ok_or_else(|| {
+            eyre!(
+                "missing deflate seek index for period type {}",
+                task.period_type_id
+            )
+        })?;
+        let mut decoder = entry.indexed_reader(index, task.position).map_err(|err| {
+            eyre!(
+                "Failed opening indexed compressed period data for key_id {} at byte offset {}: {}",
+                task.key_id,
+                task.position,
+                err
+            )
+        })?;
+
+        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
+        let mut value_offset = 0u64;
+        while value_offset < task.value_count {
+            let chunk_values = (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
+            let chunk_bytes_u64 = chunk_values
+                .checked_mul(8)
+                .ok_or_else(|| eyre!("Chunk size overflow for key_id {}", task.key_id))?;
+            let chunk_bytes = usize::try_from(chunk_bytes_u64)
+                .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", task.key_id))?;
+
+            decoder
+                .read_exact(&mut chunk_buf[..chunk_bytes])
+                .map_err(|err| {
+                    eyre!(
+                        "Failed reading indexed compressed period data for key_id {} at byte offset {}: {}",
+                        task.key_id,
+                        task.position + value_offset.saturating_mul(8),
+                        err
+                    )
+                })?;
+
+            let metadata = DataValueMetadata {
+                key_id: task.key_id,
+                sample_id: task.sample_id,
+                band_id: task.band_id,
+                membership_id: task.membership_id,
+                period_offset: task.period_offset,
+                start_value_index: task
+                    .start_value_index
+                    .checked_add(value_offset)
+                    .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?,
+            };
+            metadata.append_record_batch(appender, &chunk_buf[..chunk_bytes])?;
+            value_offset = value_offset
+                .checked_add(chunk_values)
+                .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
+        }
+
+        Ok(())
+    }
+
+    fn merge_staged_range_data_shards(
+        &self,
+        con: &mut duckdb::Connection,
+        shards: &[StagedRangeDataShard],
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
+        let target_catalog = Self::current_catalog_name(con)?;
+        let target_catalog_ident = Self::quote_ident(&target_catalog);
+        let total_merges = shards
+            .iter()
+            .map(|shard| shard.table_names.len())
+            .sum::<usize>();
+        let mut merge_index = 0usize;
+
+        for (shard_idx, shard) in shards.iter().enumerate() {
+            let shard_alias = format!("stage_range_data_{shard_idx}");
+            let shard_alias_ident = Self::quote_ident(&shard_alias);
+            let db_path = Self::sql_string_literal(shard.db_path.to_string_lossy().as_ref());
+            con.execute_batch(&format!("ATTACH '{db_path}' AS {shard_alias_ident};"))?;
+
+            for table_name in &shard.table_names {
+                merge_index += 1;
+                if let Some(report) = progress.as_mut() {
+                    report(DuckdbProgress::Event(ProgressEvent::DataMergeTableStart {
+                        index: merge_index,
+                        total: total_merges,
+                        table_name: format!("shard {} {}", shard_idx + 1, table_name),
+                    }));
+                }
+
+                let table_ident = Self::quote_ident(table_name);
+                con.execute_batch(&format!(
+                    "INSERT INTO {target_catalog_ident}.data.{table_ident}
+                     SELECT * FROM {shard_alias_ident}.data.{table_ident};"
+                ))?;
+
+                if let Some(report) = progress.as_mut() {
+                    report(DuckdbProgress::Event(ProgressEvent::DataMergeTableEnd {
+                        index: merge_index,
+                        total: total_merges,
+                    }));
+                }
+            }
+
+            con.execute_batch(&format!("DETACH {shard_alias_ident};"))?;
+            let _ = std::fs::remove_file(&shard.db_path);
+        }
+
+        Ok(())
+    }
+
     fn merge_staged_data_shards(
         &self,
         con: &mut duckdb::Connection,
@@ -2315,8 +3147,7 @@ impl SolutionDataset {
         self.create_data_table(con, plan.table_name.as_str())?;
         let mut appender = con.appender_to_db(plan.table_name.as_str(), "data")?;
 
-        const DATA_READ_CHUNK_VALUES: u64 = 4096;
-        let mut chunk_buf = vec![0u8; (DATA_READ_CHUNK_VALUES as usize) * 8];
+        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
 
         for key_id in plan.key_ids.iter().copied() {
             let ki = self.key_index(key_id)?;
@@ -2338,7 +3169,7 @@ impl SolutionDataset {
             let period_offset: i64 = ki.period_offset;
             let mut i: u64 = 0;
             while i < ki.length {
-                let chunk_values = (ki.length - i).min(DATA_READ_CHUNK_VALUES);
+                let chunk_values = (ki.length - i).min(DATA_APPEND_BATCH_VALUES);
                 let chunk_bytes_u64 = chunk_values
                     .checked_mul(8)
                     .ok_or_else(|| eyre!("Chunk size overflow for key_id {}", key_id))?;
@@ -2363,38 +3194,15 @@ impl SolutionDataset {
                         )
                     })?;
 
-                let mut chunk_i: u64 = 0;
-                while chunk_i < chunk_values {
-                    let byte_idx = (chunk_i as usize) * 8;
-                    let value = f64::from_le_bytes([
-                        chunk_buf[byte_idx],
-                        chunk_buf[byte_idx + 1],
-                        chunk_buf[byte_idx + 2],
-                        chunk_buf[byte_idx + 3],
-                        chunk_buf[byte_idx + 4],
-                        chunk_buf[byte_idx + 5],
-                        chunk_buf[byte_idx + 6],
-                        chunk_buf[byte_idx + 7],
-                    ]);
-
-                    let block_idx = i + chunk_i;
-                    let block_id_i64 = i64::try_from(block_idx)
-                        .map_err(|_| eyre!("block_id exceeds i64 for key_id {}", key_id))?
-                        .checked_add(period_offset)
-                        .and_then(|v| v.checked_add(1))
-                        .ok_or_else(|| eyre!("block_id overflow for key_id {}", key_id))?;
-
-                    appender.append_row(duckdb::params![
-                        key_id,
-                        key.sample_id,
-                        key.band_id,
-                        key.membership_id,
-                        block_id_i64,
-                        value
-                    ])?;
-
-                    chunk_i += 1;
-                }
+                let metadata = DataValueMetadata {
+                    key_id,
+                    sample_id: key.sample_id,
+                    band_id: key.band_id,
+                    membership_id: key.membership_id,
+                    period_offset,
+                    start_value_index: i,
+                };
+                metadata.append_record_batch(&mut appender, &chunk_buf[..chunk_bytes])?;
 
                 i += chunk_values;
             }
@@ -2446,10 +3254,7 @@ impl SolutionDataset {
         match mode {
             DbWriteMode::InMemoryThenCopy => Ok((duckdb::Connection::open_in_memory()?, None)),
             DbWriteMode::Direct => {
-                let staging_parent = db_path
-                    .parent()
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .unwrap_or_else(|| std::path::Path::new("."));
+                let staging_parent = Self::duckdb_staging_parent(db_path);
                 let staging_dir = tempfile::Builder::new()
                     .prefix("plexos2duckdb-stage-")
                     .tempdir_in(staging_parent)?;
@@ -2457,6 +3262,14 @@ impl SolutionDataset {
                 Ok((duckdb::Connection::open(staging_path)?, Some(staging_dir)))
             },
         }
+    }
+
+    fn duckdb_staging_parent(db_path: &std::path::Path) -> std::path::PathBuf {
+        db_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf()
     }
 
     fn persist_duckdb_database(
@@ -2485,7 +3298,11 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn read_exact_at(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    pub(crate) fn read_exact_at(
+        file: &std::fs::File,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt as _;
@@ -3659,7 +4476,7 @@ mod tests {
     }
 
     #[test]
-    fn read_zip_archive_buffers_deflated_bin_entries() -> Result<()> {
+    fn read_zip_archive_indexes_deflated_bin_entries_without_buffering() -> Result<()> {
         let temp_dir = tempfile::TempDir::new()?;
         let zip_path = temp_dir.path().join("Model_Base_Solution.zip");
 
@@ -3684,14 +4501,71 @@ mod tests {
             .get(&0)
             .ok_or_else(|| eyre!("expected period data for digit 0"))?;
 
+        let entry = match data {
+            PeriodData::CompressedZipEntry(entry) => entry,
+            _ => return Err(eyre!("expected compressed ZIP period data metadata")),
+        };
+        let index = entry.build_deflate_index(8)?;
         let mut actual = [0u8; 16];
-        data.read_exact_at(0, &mut actual)?;
+        entry.read_exact_at_with_index(&index, 0, &mut actual)?;
 
         let first = f64::from_le_bytes(actual[0..8].try_into().expect("slice length matches"));
         let second = f64::from_le_bytes(actual[8..16].try_into().expect("slice length matches"));
 
         assert_eq!(first, 1.25);
         assert_eq!(second, 2.5);
+        Ok(())
+    }
+
+    #[test]
+    fn deflate_index_reads_random_offsets_from_zip_member() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let zip_path = temp_dir.path().join("Model_Base_Solution.zip");
+        let value_count = 300_000usize;
+        let mut expected = Vec::with_capacity(value_count * 8);
+
+        let zip_file = std::fs::File::create(&zip_path)?;
+        let mut zip_writer = zip::ZipWriter::new(zip_file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        zip_writer.start_file("Model Base Solution.xml", options)?;
+        zip_writer.write_all(b"<root />")?;
+
+        zip_writer.start_file("t_data_0.BIN", options)?;
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for _ in 0..value_count {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let value = f64::from_bits(state);
+            let bytes = value.to_le_bytes();
+            expected.extend_from_slice(&bytes);
+            zip_writer.write_all(&bytes)?;
+        }
+        zip_writer.finish()?;
+
+        let (_xml_content, period_data) =
+            SolutionDataset::read_zip_archive(&zip_path, "", &mut None)?;
+        let data = period_data
+            .get(&0)
+            .ok_or_else(|| eyre!("expected period data for digit 0"))?;
+        let entry = match data {
+            PeriodData::CompressedZipEntry(entry) => entry,
+            _ => return Err(eyre!("expected compressed ZIP period data metadata")),
+        };
+        let index = entry.build_deflate_index(MIB_BYTES)?;
+        assert!(
+            index.index.checkpoint_count() > 0,
+            "expected at least one deflate checkpoint"
+        );
+
+        for offset in [0usize, 8 * 123, 8 * 4097 + 3, expected.len() - 19] {
+            let mut actual = vec![0u8; 19];
+            entry.read_exact_at_with_index(&index, offset as u64, &mut actual)?;
+            assert_eq!(actual, expected[offset..offset + 19]);
+        }
+
         Ok(())
     }
 }

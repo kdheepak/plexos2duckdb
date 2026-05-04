@@ -60,6 +60,9 @@ pub struct ConvertArgs {
     /// Number of threads to use when writing time series data tables
     #[arg(long)]
     pub n_threads: Option<std::num::NonZeroUsize>,
+    /// Deflate seek-index spacing for compressed ZIP BIN files, in MiB
+    #[arg(long, default_value_t = plexos2duckdb::DEFAULT_DEFLATE_INDEX_INTERVAL_MIB)]
+    pub deflate_index_interval_mib: u64,
     /// Output format for diagnostics and results
     #[arg(long = "format-diagnostics", value_enum, default_value_t = OutputFormat::Text)]
     pub format_diagnostics: OutputFormat,
@@ -132,6 +135,20 @@ enum ConvertJsonEvent {
         keys: usize,
     },
     DataWorkerTableEnd {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+    },
+    DataWorkerRangeStart {
+        worker_id: usize,
+        index: usize,
+        total: usize,
+        table_name: String,
+        key_id: i64,
+        start_value: u64,
+        values: u64,
+    },
+    DataWorkerRangeEnd {
         worker_id: usize,
         index: usize,
         total: usize,
@@ -493,6 +510,32 @@ fn convert(args: ConvertArgs) -> Result<()> {
                     index,
                     total,
                 },
+                plexos2duckdb::ProgressEvent::DataWorkerRangeStart {
+                    worker_id,
+                    index,
+                    total,
+                    table_name,
+                    key_id,
+                    start_value,
+                    values,
+                } => ConvertJsonEvent::DataWorkerRangeStart {
+                    worker_id,
+                    index,
+                    total,
+                    table_name,
+                    key_id,
+                    start_value,
+                    values,
+                },
+                plexos2duckdb::ProgressEvent::DataWorkerRangeEnd {
+                    worker_id,
+                    index,
+                    total,
+                } => ConvertJsonEvent::DataWorkerRangeEnd {
+                    worker_id,
+                    index,
+                    total,
+                },
                 plexos2duckdb::ProgressEvent::DataMergeTableStart {
                     index,
                     total,
@@ -529,7 +572,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
                         let bar = multi.add(ProgressBar::new(total as u64));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:28.cyan/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.cyan}",
+                                "{prefix:>9.bold} {bar:16.cyan/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.cyan}",
                             )
                             .unwrap(),
                         );
@@ -564,7 +607,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
                         let bar = multi.add(ProgressBar::new(total as u64));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:28.green/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.green}",
+                                "{prefix:>9.bold} {bar:16.green/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.green}",
                             )
                             .unwrap(),
                         );
@@ -591,6 +634,50 @@ fn convert(args: ConvertArgs) -> Result<()> {
                     }
                 }
             },
+            plexos2duckdb::ProgressEvent::DataWorkerRangeStart {
+                worker_id,
+                index,
+                total,
+                table_name,
+                key_id,
+                start_value,
+                values,
+            } => {
+                if !worker_tables_pb.contains_key(&worker_id) {
+                    if let Some(multi) = mp.as_ref() {
+                        let bar = multi.add(ProgressBar::new(total as u64));
+                        bar.set_style(
+                            ProgressStyle::with_template(
+                                "{prefix:>9.bold} {bar:16.green/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.green}",
+                            )
+                            .unwrap(),
+                        );
+                        bar.set_prefix(format!("thread-{}", worker_id + 1));
+                        worker_tables_pb.insert(worker_id, bar);
+                    }
+                }
+                if let Some(bar) = worker_tables_pb.get(&worker_id) {
+                    bar.set_length(total as u64);
+                    bar.set_position(index.saturating_sub(1) as u64);
+                    let end_value = start_value.saturating_add(values);
+                    bar.set_message(format!(
+                        "{table_name} key {key_id} {start_value}..{end_value}"
+                    ));
+                }
+            },
+            plexos2duckdb::ProgressEvent::DataWorkerRangeEnd {
+                worker_id,
+                index,
+                total,
+            } => {
+                if let Some(bar) = worker_tables_pb.get(&worker_id) {
+                    bar.set_length(total as u64);
+                    bar.set_position(index as u64);
+                    if index == total {
+                        bar.set_message("done");
+                    }
+                }
+            },
             plexos2duckdb::ProgressEvent::DataMergeTableStart {
                 index,
                 total,
@@ -601,7 +688,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
                         let bar = multi.add(ProgressBar::new(total as u64));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:28.yellow/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.yellow}",
+                                "{prefix:>9.bold} {bar:16.yellow/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.yellow}",
                             )
                             .unwrap(),
                         );
@@ -750,6 +837,16 @@ fn convert(args: ConvertArgs) -> Result<()> {
     if let Some(threads) = args.n_threads {
         builder = builder.with_data_write_threads(threads.get());
     }
+    if args.deflate_index_interval_mib == 0 {
+        return Err(eyre!(
+            "--deflate-index-interval-mib must be greater than zero"
+        ));
+    }
+    let deflate_index_interval_bytes = args
+        .deflate_index_interval_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| eyre!("--deflate-index-interval-mib is too large"))?;
+    builder = builder.with_deflate_index_interval_bytes(deflate_index_interval_bytes);
     let builder = if json_mode || !args.no_progress_bar {
         builder
             .with_progress(&mut report)
