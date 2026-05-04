@@ -569,7 +569,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
                         let bar = multi.add(ProgressBar::new(total as u64));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:16.cyan/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.cyan}",
+                                "{prefix:>9.bold} {bar:10.cyan/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.cyan}",
                             )
                             .unwrap(),
                         );
@@ -604,7 +604,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
                         let bar = multi.add(ProgressBar::new(total as u64));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:16.green/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.green}",
+                                "{prefix:>9.bold} {bar:10.green/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.green}",
                             )
                             .unwrap(),
                         );
@@ -645,7 +645,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
                         let bar = multi.add(ProgressBar::new(total as u64));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:16.green/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.green}",
+                                "{prefix:>9.bold} {bar:10.green/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.green}",
                             )
                             .unwrap(),
                         );
@@ -685,7 +685,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
                         let bar = multi.add(ProgressBar::new(total as u64));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:16.yellow/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.yellow}",
+                                "{prefix:>9.bold} {bar:10.yellow/blue} {pos:>3}/{len:3} {elapsed_precise:.dim} {msg:.yellow}",
                             )
                             .unwrap(),
                         );
