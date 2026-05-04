@@ -4,12 +4,13 @@
 use std::io::Read as _;
 use std::sync::{Arc, LazyLock};
 
-use color_eyre::{Result, eyre::eyre};
+use color_eyre::{eyre::eyre, Result};
 use duckdb::arrow::{
     array::{ArrayRef, Float64Array, Int64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use roxmltree::{Document, Node};
 
 mod deflate_index;
@@ -553,9 +554,8 @@ struct DataRangeWriteTask {
 }
 
 #[derive(Debug)]
-struct StagedRangeDataShard {
-    db_path: std::path::PathBuf,
-    table_names: Vec<String>,
+struct StagedDataFiles {
+    table_files: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>,
 }
 
 #[derive(Debug)]
@@ -627,12 +627,9 @@ impl DataRangeWriteTask {
     }
 }
 
-impl StagedRangeDataShard {
-    fn new(db_path: std::path::PathBuf, table_names: Vec<String>) -> Self {
-        Self {
-            db_path,
-            table_names,
-        }
+impl StagedDataFiles {
+    fn new(table_files: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>) -> Self {
+        Self { table_files }
     }
 }
 
@@ -647,7 +644,7 @@ impl DataRangeWriteWorkerEvent {
 }
 
 impl DataValueMetadata {
-    fn append_record_batch(&self, appender: &mut duckdb::Appender<'_>, bytes: &[u8]) -> Result<()> {
+    fn record_batch(&self, bytes: &[u8]) -> Result<RecordBatch> {
         if bytes.len() % 8 != 0 {
             return Err(eyre!(
                 "Data chunk byte length is not a multiple of f64 width for key_id {}",
@@ -676,9 +673,10 @@ impl DataValueMetadata {
             Arc::new(Int64Array::from(block_ids)),
             Arc::new(Float64Array::from(values)),
         ];
-        let record_batch = RecordBatch::try_new(DATA_RECORD_BATCH_SCHEMA.clone(), columns)?;
-        appender.append_record_batch(record_batch)?;
-        Ok(())
+        Ok(RecordBatch::try_new(
+            DATA_RECORD_BATCH_SCHEMA.clone(),
+            columns,
+        )?)
     }
 }
 
@@ -798,11 +796,6 @@ struct DataTableWritePlan {
     table_name: String,
     key_ids: Vec<i64>,
     estimated_values: u128,
-}
-
-#[derive(Debug)]
-struct StagedDataShard {
-    db_path: std::path::PathBuf,
 }
 
 #[derive(Debug)]
@@ -2349,8 +2342,11 @@ impl SolutionDataset {
             return Ok(());
         }
 
+        for plan in &plans {
+            self.create_data_table(con, plan.table_name.as_str())?;
+        }
+
         let staging_parent = Self::duckdb_staging_parent(db_path);
-        let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
         if self.has_compressed_period_data() {
             let range_worker_count = Self::resolve_data_range_write_threads(data_write_threads);
             return self.populate_table_data_indexed_ranges(
@@ -2363,10 +2359,8 @@ impl SolutionDataset {
             );
         }
 
-        if worker_count <= 1 {
-            return self.populate_table_data_sequential(con, plans, progress);
-        }
-        self.populate_table_data_parallel(
+        let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
+        self.populate_table_data_uncompressed_parquet(
             con,
             plans,
             worker_count,
@@ -2438,35 +2432,7 @@ impl SolutionDataset {
             .any(PeriodData::is_compressed_zip_entry)
     }
 
-    fn populate_table_data_sequential(
-        &self,
-        con: &mut duckdb::Connection,
-        plans: Vec<DataTableWritePlan>,
-        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
-    ) -> Result<()> {
-        let total_tables = plans.len();
-
-        for (table_idx, plan) in plans.into_iter().enumerate() {
-            if let Some(report) = progress.as_mut() {
-                report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
-                    index: table_idx + 1,
-                    total: total_tables,
-                    table_name: plan.table_name.clone(),
-                    keys: plan.key_ids.len(),
-                }));
-            }
-
-            self.append_single_data_table(con, &plan)?;
-
-            if let Some(report) = progress.as_mut() {
-                report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn populate_table_data_parallel(
+    fn populate_table_data_uncompressed_parquet(
         &self,
         con: &mut duckdb::Connection,
         plans: Vec<DataTableWritePlan>,
@@ -2476,64 +2442,57 @@ impl SolutionDataset {
     ) -> Result<()> {
         let total_tables = plans.len();
         let worker_plans = Self::distribute_data_table_plans(plans, worker_count);
+        Self::report_duckdb_progress(
+            progress,
+            &format!(
+                "Writing uncompressed BIN tables with {} workers",
+                worker_plans.len()
+            ),
+        );
 
         let staging_dir = tempfile::Builder::new()
-            .prefix("plexos2duckdb-data-shards-")
+            .prefix("plexos2duckdb-data-parquet-")
             .tempdir_in(staging_parent)?;
         let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
-        let staged_shards = std::thread::scope(|scope| -> Result<Vec<StagedDataShard>> {
+        let staged_files = std::thread::scope(|scope| -> Result<Vec<StagedDataFiles>> {
             let mut handles = Vec::with_capacity(worker_plans.len());
             for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
-                let shard_path = staging_dir
-                    .path()
-                    .join(format!("data_stage_{worker_idx}.duckdb"));
+                let worker_dir = staging_dir.path().join(format!("data_worker_{worker_idx}"));
                 let worker_tx = tx.clone();
 
-                handles.push(scope.spawn(move || -> Result<StagedDataShard> {
-                    let mut worker_con = duckdb::Connection::open(&shard_path)?;
-                    worker_con.execute_batch(
-                        "SET preserve_insertion_order = false; CREATE SCHEMA IF NOT EXISTS data;",
+                handles.push(scope.spawn(move || -> Result<StagedDataFiles> {
+                    std::fs::create_dir_all(&worker_dir)?;
+                    let table_files = self.write_data_table_plans_to_parquet_files(
+                        worker_idx,
+                        worker_plan,
+                        &worker_dir,
+                        &worker_tx,
                     )?;
-
-                    let worker_total = worker_plan.len();
-                    for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
-                        let worker_table_index = worker_table_idx + 1;
-                        let table_name = table_plan.table_name.clone();
-                        let keys = table_plan.key_ids.len();
-                        let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
-                            worker_id: worker_idx,
-                            index: worker_table_index,
-                            total: worker_total,
-                            table_name: table_name.clone(),
-                            keys,
-                        });
-
-                        self.append_single_data_table(&mut worker_con, &table_plan)?;
-                        let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
-                            worker_id: worker_idx,
-                            index: worker_table_index,
-                            total: worker_total,
-                            table_name,
-                            keys,
-                        });
-                    }
-
-                    Ok(StagedDataShard {
-                        db_path: shard_path,
-                    })
+                    Ok(StagedDataFiles::new(table_files))
                 }));
             }
             drop(tx);
 
             let mut completed_tables = 0usize;
             while completed_tables < total_tables {
-                let event = rx.recv().map_err(|_| {
-                    eyre!(
-                        "Worker progress channel closed before all tables completed ({}/{})",
-                        completed_tables,
-                        total_tables
-                    )
-                })?;
+                let event = match rx.recv() {
+                    Ok(event) => event,
+                    Err(_) => {
+                        for (worker_idx, handle) in handles.into_iter().enumerate() {
+                            let result = handle
+                                .join()
+                                .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?;
+                            if let Err(err) = result {
+                                return Err(eyre!("Data worker {} failed: {err}", worker_idx + 1));
+                            }
+                        }
+                        return Err(eyre!(
+                            "Worker progress channel closed before all tables completed ({}/{})",
+                            completed_tables,
+                            total_tables
+                        ));
+                    },
+                };
                 match event {
                     DataWriteWorkerEvent::TableStarted {
                         worker_id,
@@ -2581,19 +2540,21 @@ impl SolutionDataset {
                 }
             }
 
-            let mut shards = Vec::with_capacity(handles.len());
-            Self::report_duckdb_progress(progress, "Finalizing staged worker shards");
-            for handle in handles {
+            let mut staged_files = Vec::with_capacity(handles.len());
+            Self::report_duckdb_progress(progress, "Finalizing staged parquet files");
+            for (worker_idx, handle) in handles.into_iter().enumerate() {
                 let result = handle
                     .join()
-                    .map_err(|_| eyre!("A data writer thread panicked"))?;
-                shards.push(result?);
+                    .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?;
+                staged_files.push(
+                    result.map_err(|err| eyre!("Data worker {} failed: {err}", worker_idx + 1))?,
+                );
             }
-            Ok(shards)
+            Ok(staged_files)
         })?;
 
-        Self::report_duckdb_progress(progress, "Merging staged data tables");
-        self.merge_staged_data_shards(con, &staged_shards, progress)?;
+        Self::report_duckdb_progress(progress, "Merging staged parquet files");
+        self.merge_staged_data_files(con, &staged_files, progress)?;
         Ok(())
     }
 
@@ -2620,6 +2581,85 @@ impl SolutionDataset {
         worker_plans
     }
 
+    fn write_data_table_plans_to_parquet_files(
+        &self,
+        worker_idx: usize,
+        worker_plan: Vec<DataTableWritePlan>,
+        worker_dir: &std::path::Path,
+        worker_tx: &std::sync::mpsc::Sender<DataWriteWorkerEvent>,
+    ) -> Result<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>> {
+        let worker_total = worker_plan.len();
+        let mut table_files = std::collections::BTreeMap::<String, Vec<std::path::PathBuf>>::new();
+
+        for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
+            let worker_table_index = worker_table_idx + 1;
+            let table_name = table_plan.table_name.clone();
+            let keys = table_plan.key_ids.len();
+            let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
+                worker_id: worker_idx,
+                index: worker_table_index,
+                total: worker_total,
+                table_name: table_name.clone(),
+                keys,
+            });
+
+            let parquet_path = worker_dir.join(format!("table_{worker_table_index:05}.parquet"));
+            let mut writer = Self::open_data_parquet_writer(&parquet_path)?;
+            self.write_data_table_to_parquet(&mut writer, &table_plan)?;
+            writer.close()?;
+
+            table_files
+                .entry(table_name.clone())
+                .or_default()
+                .push(parquet_path);
+
+            let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
+                worker_id: worker_idx,
+                index: worker_table_index,
+                total: worker_total,
+                table_name,
+                keys,
+            });
+        }
+
+        Ok(table_files)
+    }
+
+    fn write_data_table_to_parquet(
+        &self,
+        writer: &mut ArrowWriter<std::fs::File>,
+        plan: &DataTableWritePlan,
+    ) -> Result<()> {
+        for key_id in plan.key_ids.iter().copied() {
+            let ki = self.key_index(key_id)?;
+            let key = self.key(key_id)?;
+
+            if ki.position % 8 != 0 {
+                return Err(eyre!(
+                    "BIN position misaligned for key_id {} (pos_bytes={})",
+                    key_id,
+                    ki.position
+                ));
+            }
+
+            let task = DataRangeWriteTask {
+                table_name: plan.table_name.clone(),
+                key_id,
+                sample_id: key.sample_id,
+                band_id: key.band_id,
+                membership_id: key.membership_id,
+                period_type_id: ki.period_type_id,
+                position: ki.position,
+                start_value_index: 0,
+                value_count: ki.length,
+                period_offset: ki.period_offset,
+            };
+            self.write_data_range_task_to_parquet(writer, &task, None)?;
+        }
+
+        Ok(())
+    }
+
     fn populate_table_data_indexed_ranges(
         &self,
         con: &mut duckdb::Connection,
@@ -2639,89 +2679,64 @@ impl SolutionDataset {
             return Ok(());
         }
 
-        for plan in &plans {
-            self.create_data_table(con, plan.table_name.as_str())?;
-        }
-
         let worker_count = worker_count.min(tasks.len()).max(1);
         let total_ranges = tasks.len();
         let worker_tasks = Self::distribute_data_range_write_tasks(tasks, worker_count);
         Self::report_duckdb_progress(
             progress,
             &format!(
-                "Writing indexed compressed BIN ranges with {} shard workers",
+                "Writing indexed compressed BIN ranges with {} workers",
                 worker_tasks.len()
             ),
         );
 
         let staging_dir = tempfile::Builder::new()
-            .prefix("plexos2duckdb-range-shards-")
+            .prefix("plexos2duckdb-range-parquet-")
             .tempdir_in(staging_parent)?;
         let (tx, rx) = std::sync::mpsc::channel::<DataRangeWriteWorkerEvent>();
-        let staged_shards = std::thread::scope(|scope| -> Result<Vec<StagedRangeDataShard>> {
+        let staged_files = std::thread::scope(|scope| -> Result<Vec<StagedDataFiles>> {
             let mut handles = Vec::with_capacity(worker_tasks.len());
             for (worker_idx, worker_task_list) in worker_tasks.into_iter().enumerate() {
-                let shard_path = staging_dir
+                let worker_dir = staging_dir
                     .path()
-                    .join(format!("data_range_stage_{worker_idx}.duckdb"));
+                    .join(format!("range_worker_{worker_idx}"));
                 let worker_tx = tx.clone();
                 let compressed_indexes = &compressed_indexes;
 
-                handles.push(scope.spawn(move || -> Result<StagedRangeDataShard> {
-                    let mut worker_con = duckdb::Connection::open(&shard_path)?;
-                    worker_con.execute_batch(
-                        "SET preserve_insertion_order = false; CREATE SCHEMA IF NOT EXISTS data;",
+                handles.push(scope.spawn(move || -> Result<StagedDataFiles> {
+                    std::fs::create_dir_all(&worker_dir)?;
+                    let table_files = self.write_data_range_tasks_to_parquet_files(
+                        worker_idx,
+                        worker_task_list,
+                        &worker_dir,
+                        compressed_indexes,
+                        &worker_tx,
                     )?;
-
-                    let worker_total = worker_task_list.len();
-                    let mut created_tables = std::collections::BTreeSet::<String>::new();
-                    for (task_idx, task) in worker_task_list.into_iter().enumerate() {
-                        let worker_task_index = task_idx + 1;
-                        if created_tables.insert(task.table_name.clone()) {
-                            self.create_data_table(&mut worker_con, task.table_name.as_str())?;
-                        }
-
-                        let _ = worker_tx.send(DataRangeWriteWorkerEvent::RangeStarted {
-                            worker_id: worker_idx,
-                            index: worker_task_index,
-                            total: worker_total,
-                            table_name: task.table_name.clone(),
-                            key_id: task.key_id,
-                            start_value: task.start_value_index,
-                            values: task.value_count,
-                        });
-
-                        {
-                            let mut appender =
-                                worker_con.appender_to_db(task.table_name.as_str(), "data")?;
-                            self.append_data_range_task(&mut appender, &task, compressed_indexes)?;
-                            appender.flush()?;
-                        }
-
-                        let _ = worker_tx.send(DataRangeWriteWorkerEvent::completed(
-                            worker_idx,
-                            worker_task_index,
-                            worker_total,
-                        ));
-                    }
-
-                    Ok(StagedRangeDataShard::new(
-                        shard_path,
-                        created_tables.into_iter().collect(),
-                    ))
+                    Ok(StagedDataFiles::new(table_files))
                 }));
             }
             drop(tx);
 
             let mut completed_ranges = 0usize;
             while completed_ranges < total_ranges {
-                let event = rx.recv().map_err(|_| {
-                    eyre!(
-                        "Range worker progress channel closed before all ranges completed ({}/{})",
-                        completed_ranges,
-                        total_ranges
-                    )
-                })?;
+                let event = match rx.recv() {
+                    Ok(event) => event,
+                    Err(_) => {
+                        for (worker_idx, handle) in handles.into_iter().enumerate() {
+                            let result = handle
+                                .join()
+                                .map_err(|_| eyre!("Range worker {} panicked", worker_idx + 1))?;
+                            if let Err(err) = result {
+                                return Err(eyre!("Range worker {} failed: {err}", worker_idx + 1));
+                            }
+                        }
+                        return Err(eyre!(
+                            "Range worker progress channel closed before all ranges completed ({}/{})",
+                            completed_ranges,
+                            total_ranges
+                        ));
+                    },
+                };
                 match event {
                     DataRangeWriteWorkerEvent::RangeStarted {
                         worker_id,
@@ -2761,20 +2776,95 @@ impl SolutionDataset {
                 }
             }
 
-            let mut shards = Vec::with_capacity(handles.len());
-            Self::report_duckdb_progress(progress, "Finalizing indexed range shards");
-            for handle in handles {
+            let mut staged_files = Vec::with_capacity(handles.len());
+            Self::report_duckdb_progress(progress, "Finalizing indexed range parquet files");
+            for (worker_idx, handle) in handles.into_iter().enumerate() {
                 let result = handle
                     .join()
-                    .map_err(|_| eyre!("A range data writer thread panicked"))?;
-                shards.push(result?);
+                    .map_err(|_| eyre!("Range worker {} panicked", worker_idx + 1))?;
+                staged_files.push(
+                    result.map_err(|err| eyre!("Range worker {} failed: {err}", worker_idx + 1))?,
+                );
             }
-            Ok(shards)
+            Ok(staged_files)
         })?;
 
-        Self::report_duckdb_progress(progress, "Merging indexed range shards");
-        self.merge_staged_range_data_shards(con, &staged_shards, progress)?;
+        Self::report_duckdb_progress(progress, "Merging indexed range parquet files");
+        self.merge_staged_data_files(con, &staged_files, progress)?;
         Ok(())
+    }
+
+    fn write_data_range_tasks_to_parquet_files(
+        &self,
+        worker_idx: usize,
+        worker_task_list: Vec<DataRangeWriteTask>,
+        worker_dir: &std::path::Path,
+        compressed_indexes: &CompressedDeflateIndexes,
+        worker_tx: &std::sync::mpsc::Sender<DataRangeWriteWorkerEvent>,
+    ) -> Result<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>> {
+        let worker_total = worker_task_list.len();
+        let mut table_files = std::collections::BTreeMap::<String, Vec<std::path::PathBuf>>::new();
+        let mut current_table_name: Option<String> = None;
+        let mut current_writer: Option<ArrowWriter<std::fs::File>> = None;
+        let mut table_file_index = 0usize;
+
+        for (task_idx, task) in worker_task_list.into_iter().enumerate() {
+            if current_table_name.as_deref() != Some(task.table_name.as_str()) {
+                if let Some(writer) = current_writer.take() {
+                    writer.close()?;
+                }
+
+                table_file_index += 1;
+                let parquet_path = worker_dir.join(format!("table_{table_file_index:05}.parquet"));
+                current_writer = Some(Self::open_data_parquet_writer(&parquet_path)?);
+                current_table_name = Some(task.table_name.clone());
+                table_files
+                    .entry(task.table_name.clone())
+                    .or_default()
+                    .push(parquet_path);
+            }
+
+            let worker_task_index = task_idx + 1;
+            let _ = worker_tx.send(DataRangeWriteWorkerEvent::RangeStarted {
+                worker_id: worker_idx,
+                index: worker_task_index,
+                total: worker_total,
+                table_name: task.table_name.clone(),
+                key_id: task.key_id,
+                start_value: task.start_value_index,
+                values: task.value_count,
+            });
+
+            let writer = current_writer
+                .as_mut()
+                .expect("range task writer is opened before writing");
+            self.write_data_range_task_to_parquet(writer, &task, Some(compressed_indexes))?;
+
+            let _ = worker_tx.send(DataRangeWriteWorkerEvent::completed(
+                worker_idx,
+                worker_task_index,
+                worker_total,
+            ));
+        }
+
+        if let Some(writer) = current_writer {
+            writer.close()?;
+        }
+
+        Ok(table_files)
+    }
+
+    fn open_data_parquet_writer(path: &std::path::Path) -> Result<ArrowWriter<std::fs::File>> {
+        let file = std::fs::File::create(path)?;
+        let writer_properties = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(DATA_APPEND_BATCH_VALUES as usize))
+            .build();
+        Ok(ArrowWriter::try_new(
+            file,
+            DATA_RECORD_BATCH_SCHEMA.clone(),
+            Some(writer_properties),
+        )?)
     }
 
     fn build_compressed_period_data_indexes(
@@ -2916,299 +3006,198 @@ impl SolutionDataset {
         worker_tasks
     }
 
-    fn append_data_range_task(
+    fn write_data_range_task_to_parquet(
         &self,
-        appender: &mut duckdb::Appender<'_>,
+        writer: &mut ArrowWriter<std::fs::File>,
         task: &DataRangeWriteTask,
-        compressed_indexes: &CompressedDeflateIndexes,
+        compressed_indexes: Option<&CompressedDeflateIndexes>,
+    ) -> Result<()> {
+        self.write_data_range_task_batches(task, compressed_indexes, |record_batch| {
+            writer.write(&record_batch)?;
+            Ok(())
+        })
+    }
+
+    fn write_data_range_task_batches(
+        &self,
+        task: &DataRangeWriteTask,
+        compressed_indexes: Option<&CompressedDeflateIndexes>,
+        mut write_batch: impl FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
         let period_data = self
             .period_data
             .get(&task.period_type_id)
             .ok_or_else(|| eyre!("period type not found: {}", task.period_type_id))?;
 
-        if let PeriodData::CompressedZipEntry(entry) = period_data {
-            return self.append_compressed_data_range_task(
-                appender,
-                task,
-                entry,
-                compressed_indexes,
-            );
-        }
-
         let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
         let mut value_offset = 0u64;
-        while value_offset < task.value_count {
-            let chunk_values = (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
-            let chunk_bytes_u64 = chunk_values
-                .checked_mul(8)
-                .ok_or_else(|| eyre!("Chunk size overflow for key_id {}", task.key_id))?;
-            let chunk_bytes = usize::try_from(chunk_bytes_u64)
-                .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", task.key_id))?;
-            let offset_delta = value_offset
-                .checked_mul(8)
-                .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
-            let chunk_offset = task
-                .position
-                .checked_add(offset_delta)
-                .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
 
-            period_data
-                .read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes])
-                .map_err(|err| {
+        match period_data {
+            PeriodData::CompressedZipEntry(entry) => {
+                let compressed_indexes = compressed_indexes.ok_or_else(|| {
                     eyre!(
-                        "Failed reading period data for key_id {} at byte offset {}: {}",
+                        "missing deflate seek indexes for compressed period type {}",
+                        task.period_type_id
+                    )
+                })?;
+                let index = compressed_indexes.get(task.period_type_id).ok_or_else(|| {
+                    eyre!(
+                        "missing deflate seek index for period type {}",
+                        task.period_type_id
+                    )
+                })?;
+                let mut decoder = entry.indexed_reader(index, task.position).map_err(|err| {
+                    eyre!(
+                        "Failed opening indexed compressed period data for key_id {} at byte offset {}: {}",
                         task.key_id,
-                        chunk_offset,
+                        task.position,
                         err
                     )
                 })?;
 
-            let metadata = DataValueMetadata {
-                key_id: task.key_id,
-                sample_id: task.sample_id,
-                band_id: task.band_id,
-                membership_id: task.membership_id,
-                period_offset: task.period_offset,
-                start_value_index: task
-                    .start_value_index
-                    .checked_add(value_offset)
-                    .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?,
-            };
-            metadata.append_record_batch(appender, &chunk_buf[..chunk_bytes])?;
-            value_offset = value_offset
-                .checked_add(chunk_values)
-                .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
+                while value_offset < task.value_count {
+                    let chunk_values =
+                        (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
+                    let chunk_bytes = Self::data_chunk_byte_len(task.key_id, chunk_values)?;
+
+                    decoder
+                        .read_exact(&mut chunk_buf[..chunk_bytes])
+                        .map_err(|err| {
+                            eyre!(
+                                "Failed reading indexed compressed period data for key_id {} at byte offset {}: {}",
+                                task.key_id,
+                                task.position + value_offset.saturating_mul(8),
+                                err
+                            )
+                        })?;
+
+                    Self::write_data_range_batch(
+                        task,
+                        value_offset,
+                        &chunk_buf[..chunk_bytes],
+                        &mut write_batch,
+                    )?;
+                    value_offset = value_offset
+                        .checked_add(chunk_values)
+                        .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
+                }
+            },
+            _ => {
+                while value_offset < task.value_count {
+                    let chunk_values =
+                        (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
+                    let chunk_bytes = Self::data_chunk_byte_len(task.key_id, chunk_values)?;
+                    let offset_delta = value_offset
+                        .checked_mul(8)
+                        .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
+                    let chunk_offset = task
+                        .position
+                        .checked_add(offset_delta)
+                        .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", task.key_id))?;
+
+                    period_data
+                        .read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes])
+                        .map_err(|err| {
+                            eyre!(
+                                "Failed reading period data for key_id {} at byte offset {}: {}",
+                                task.key_id,
+                                chunk_offset,
+                                err
+                            )
+                        })?;
+
+                    Self::write_data_range_batch(
+                        task,
+                        value_offset,
+                        &chunk_buf[..chunk_bytes],
+                        &mut write_batch,
+                    )?;
+                    value_offset = value_offset
+                        .checked_add(chunk_values)
+                        .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
+                }
+            },
         }
 
         Ok(())
     }
 
-    fn append_compressed_data_range_task(
-        &self,
-        appender: &mut duckdb::Appender<'_>,
+    fn write_data_range_batch(
         task: &DataRangeWriteTask,
-        entry: &CompressedZipPeriodData,
-        compressed_indexes: &CompressedDeflateIndexes,
+        value_offset: u64,
+        bytes: &[u8],
+        write_batch: &mut impl FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
-        let index = compressed_indexes.get(task.period_type_id).ok_or_else(|| {
-            eyre!(
-                "missing deflate seek index for period type {}",
-                task.period_type_id
-            )
-        })?;
-        let mut decoder = entry.indexed_reader(index, task.position).map_err(|err| {
-            eyre!(
-                "Failed opening indexed compressed period data for key_id {} at byte offset {}: {}",
-                task.key_id,
-                task.position,
-                err
-            )
-        })?;
-
-        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
-        let mut value_offset = 0u64;
-        while value_offset < task.value_count {
-            let chunk_values = (task.value_count - value_offset).min(DATA_APPEND_BATCH_VALUES);
-            let chunk_bytes_u64 = chunk_values
-                .checked_mul(8)
-                .ok_or_else(|| eyre!("Chunk size overflow for key_id {}", task.key_id))?;
-            let chunk_bytes = usize::try_from(chunk_bytes_u64)
-                .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", task.key_id))?;
-
-            decoder
-                .read_exact(&mut chunk_buf[..chunk_bytes])
-                .map_err(|err| {
-                    eyre!(
-                        "Failed reading indexed compressed period data for key_id {} at byte offset {}: {}",
-                        task.key_id,
-                        task.position + value_offset.saturating_mul(8),
-                        err
-                    )
-                })?;
-
-            let metadata = DataValueMetadata {
-                key_id: task.key_id,
-                sample_id: task.sample_id,
-                band_id: task.band_id,
-                membership_id: task.membership_id,
-                period_offset: task.period_offset,
-                start_value_index: task
-                    .start_value_index
-                    .checked_add(value_offset)
-                    .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?,
-            };
-            metadata.append_record_batch(appender, &chunk_buf[..chunk_bytes])?;
-            value_offset = value_offset
-                .checked_add(chunk_values)
-                .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?;
-        }
+        let metadata = DataValueMetadata {
+            key_id: task.key_id,
+            sample_id: task.sample_id,
+            band_id: task.band_id,
+            membership_id: task.membership_id,
+            period_offset: task.period_offset,
+            start_value_index: task
+                .start_value_index
+                .checked_add(value_offset)
+                .ok_or_else(|| eyre!("Value index overflow for key_id {}", task.key_id))?,
+        };
+        write_batch(metadata.record_batch(bytes)?)?;
 
         Ok(())
     }
 
-    fn merge_staged_range_data_shards(
+    fn data_chunk_byte_len(key_id: i64, chunk_values: u64) -> Result<usize> {
+        let chunk_bytes_u64 = chunk_values
+            .checked_mul(8)
+            .ok_or_else(|| eyre!("Chunk size overflow for key_id {}", key_id))?;
+        usize::try_from(chunk_bytes_u64)
+            .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", key_id))
+    }
+
+    fn merge_staged_data_files(
         &self,
         con: &mut duckdb::Connection,
-        shards: &[StagedRangeDataShard],
+        staged_files: &[StagedDataFiles],
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
         let target_catalog = Self::current_catalog_name(con)?;
         let target_catalog_ident = Self::quote_ident(&target_catalog);
-        let total_merges = shards
-            .iter()
-            .map(|shard| shard.table_names.len())
-            .sum::<usize>();
-        let mut merge_index = 0usize;
-
-        for (shard_idx, shard) in shards.iter().enumerate() {
-            let shard_alias = format!("stage_range_data_{shard_idx}");
-            let shard_alias_ident = Self::quote_ident(&shard_alias);
-            let db_path = Self::sql_string_literal(shard.db_path.to_string_lossy().as_ref());
-            con.execute_batch(&format!("ATTACH '{db_path}' AS {shard_alias_ident};"))?;
-
-            for table_name in &shard.table_names {
-                merge_index += 1;
-                if let Some(report) = progress.as_mut() {
-                    report(DuckdbProgress::Event(ProgressEvent::DataMergeTableStart {
-                        index: merge_index,
-                        total: total_merges,
-                        table_name: format!("shard {} {}", shard_idx + 1, table_name),
-                    }));
-                }
-
-                let table_ident = Self::quote_ident(table_name);
-                con.execute_batch(&format!(
-                    "INSERT INTO {target_catalog_ident}.data.{table_ident}
-                     SELECT * FROM {shard_alias_ident}.data.{table_ident};"
-                ))?;
-
-                if let Some(report) = progress.as_mut() {
-                    report(DuckdbProgress::Event(ProgressEvent::DataMergeTableEnd {
-                        index: merge_index,
-                        total: total_merges,
-                    }));
-                }
+        let mut files_by_table =
+            std::collections::BTreeMap::<String, Vec<std::path::PathBuf>>::new();
+        for staged_file_set in staged_files {
+            for (table_name, files) in &staged_file_set.table_files {
+                files_by_table
+                    .entry(table_name.clone())
+                    .or_default()
+                    .extend(files.iter().cloned());
             }
-
-            con.execute_batch(&format!("DETACH {shard_alias_ident};"))?;
-            let _ = std::fs::remove_file(&shard.db_path);
         }
+        let total_merges = files_by_table.len();
 
-        Ok(())
-    }
-
-    fn merge_staged_data_shards(
-        &self,
-        con: &mut duckdb::Connection,
-        shards: &[StagedDataShard],
-        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
-    ) -> Result<()> {
-        let target_catalog = Self::current_catalog_name(con)?;
-        let target_catalog_ident = Self::quote_ident(&target_catalog);
-        let total_shards = shards.len();
-
-        for (idx, shard) in shards.iter().enumerate() {
-            let shard_alias = format!("stage_data_{idx}");
-            let shard_alias_ident = Self::quote_ident(&shard_alias);
-            let db_path = Self::sql_string_literal(shard.db_path.to_string_lossy().as_ref());
-            let merge_index = idx + 1;
-
+        for (table_idx, (table_name, files)) in files_by_table.into_iter().enumerate() {
+            let merge_index = table_idx + 1;
             if let Some(report) = progress.as_mut() {
                 report(DuckdbProgress::Event(ProgressEvent::DataMergeTableStart {
                     index: merge_index,
-                    total: total_shards,
-                    table_name: format!("shard {}", merge_index),
+                    total: total_merges,
+                    table_name: table_name.clone(),
                 }));
             }
 
-            con.execute_batch(&format!("ATTACH '{db_path}' AS {shard_alias_ident};"))?;
+            let table_ident = Self::quote_ident(&table_name);
+            let parquet_paths =
+                Self::sql_string_list(files.iter().map(|path| path.to_string_lossy().into_owned()));
             con.execute_batch(&format!(
-                "COPY FROM DATABASE {shard_alias_ident} TO {target_catalog_ident};"
+                "INSERT INTO {target_catalog_ident}.data.{table_ident}
+                 SELECT * FROM read_parquet({parquet_paths});"
             ))?;
-            con.execute_batch(&format!("DETACH {shard_alias_ident};"))?;
 
             if let Some(report) = progress.as_mut() {
                 report(DuckdbProgress::Event(ProgressEvent::DataMergeTableEnd {
                     index: merge_index,
-                    total: total_shards,
+                    total: total_merges,
                 }));
             }
         }
 
-        Ok(())
-    }
-
-    fn append_single_data_table(
-        &self,
-        con: &mut duckdb::Connection,
-        plan: &DataTableWritePlan,
-    ) -> Result<()> {
-        self.create_data_table(con, plan.table_name.as_str())?;
-        let mut appender = con.appender_to_db(plan.table_name.as_str(), "data")?;
-
-        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
-
-        for key_id in plan.key_ids.iter().copied() {
-            let ki = self.key_index(key_id)?;
-            let key = self.key(key_id)?;
-
-            let period_data = self
-                .period_data
-                .get(&ki.period_type_id)
-                .ok_or_else(|| eyre!("period type not found: {}", ki.period_type_id))?;
-
-            if ki.position % 8 != 0 {
-                return Err(eyre!(
-                    "BIN position misaligned for key_id {} (pos_bytes={})",
-                    key_id,
-                    ki.position
-                ));
-            }
-
-            let period_offset: i64 = ki.period_offset;
-            let mut i: u64 = 0;
-            while i < ki.length {
-                let chunk_values = (ki.length - i).min(DATA_APPEND_BATCH_VALUES);
-                let chunk_bytes_u64 = chunk_values
-                    .checked_mul(8)
-                    .ok_or_else(|| eyre!("Chunk size overflow for key_id {}", key_id))?;
-                let chunk_bytes = usize::try_from(chunk_bytes_u64)
-                    .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", key_id))?;
-                let offset_delta = i
-                    .checked_mul(8)
-                    .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
-                let chunk_offset = ki
-                    .position
-                    .checked_add(offset_delta)
-                    .ok_or_else(|| eyre!("Byte offset overflow for key_id {}", key_id))?;
-
-                period_data
-                    .read_exact_at(chunk_offset, &mut chunk_buf[..chunk_bytes])
-                    .map_err(|err| {
-                        eyre!(
-                            "Failed reading period data for key_id {} at byte offset {}: {}",
-                            key_id,
-                            chunk_offset,
-                            err
-                        )
-                    })?;
-
-                let metadata = DataValueMetadata {
-                    key_id,
-                    sample_id: key.sample_id,
-                    band_id: key.band_id,
-                    membership_id: key.membership_id,
-                    period_offset,
-                    start_value_index: i,
-                };
-                metadata.append_record_batch(&mut appender, &chunk_buf[..chunk_bytes])?;
-
-                i += chunk_values;
-            }
-        }
-
-        appender.flush()?;
         Ok(())
     }
 
@@ -3235,6 +3224,14 @@ impl SolutionDataset {
 
     fn sql_string_literal(value: &str) -> String {
         value.replace('\'', "''")
+    }
+
+    fn sql_string_list(values: impl IntoIterator<Item = String>) -> String {
+        let mut sql_values = Vec::new();
+        for value in values {
+            sql_values.push(format!("'{}'", Self::sql_string_literal(&value)));
+        }
+        format!("[{}]", sql_values.join(", "))
     }
 
     fn current_catalog_name(con: &duckdb::Connection) -> Result<String> {
@@ -4463,6 +4460,151 @@ mod tests {
         Ok(())
     }
 
+    fn file_period_table_specs() -> [(&'static str, [f64; 3]); 4] {
+        [
+            ("ST__Interval__FileFixture__MetricA", [1.0, 2.5, 3.75]),
+            ("ST__Interval__FileFixture__MetricB", [10.0, 11.5, 12.75]),
+            ("ST__Interval__FileFixture__MetricC", [20.0, 21.5, 22.75]),
+            ("ST__Interval__FileFixture__MetricD", [30.0, 31.5, 32.75]),
+        ]
+    }
+
+    fn write_file_period_data_database(
+        threads: usize,
+    ) -> Result<(tempfile::TempDir, std::path::PathBuf)> {
+        let output_dir = tempfile::TempDir::new()?;
+        let bin_path = output_dir.path().join("t_data_0.BIN");
+        let mut bin_file = std::fs::File::create(&bin_path)?;
+
+        let mut key = indexmap::IndexMap::new();
+        let mut key_index = indexmap::IndexMap::new();
+        let mut table_key_index_mapping = std::collections::HashMap::new();
+        let mut byte_position = 0u64;
+
+        for (table_idx, (table_name, values)) in file_period_table_specs().into_iter().enumerate() {
+            for value in values {
+                bin_file.write_all(&value.to_le_bytes())?;
+            }
+
+            let key_id = 100 + i64::try_from(table_idx)?;
+            let sample_id = 200 + i64::try_from(table_idx)?;
+            let band_id = 300 + i64::try_from(table_idx)?;
+            let membership_id = 400 + i64::try_from(table_idx)?;
+            let period_offset = i64::try_from(table_idx)? * 10;
+            key.insert(
+                key_id,
+                Key {
+                    key_id,
+                    phase_id: 4,
+                    is_summary: false,
+                    band_id,
+                    membership_id,
+                    model_id: 1,
+                    property_id: 500 + i64::try_from(table_idx)?,
+                    sample_id,
+                    timeslice_id: 0,
+                },
+            );
+            key_index.insert(
+                key_id,
+                KeyIndex {
+                    key_id,
+                    period_type_id: 0,
+                    length: u64::try_from(values.len())?,
+                    position: byte_position,
+                    period_offset,
+                },
+            );
+            table_key_index_mapping.insert(table_name.to_string(), vec![key_id]);
+            let bytes_written = u64::try_from(values.len())?
+                .checked_mul(8)
+                .ok_or_else(|| eyre!("test BIN byte length overflow"))?;
+            byte_position = byte_position
+                .checked_add(bytes_written)
+                .ok_or_else(|| eyre!("test BIN byte position overflow"))?;
+        }
+        drop(bin_file);
+
+        let mut period_data = indexmap::IndexMap::new();
+        period_data.insert(0, std::fs::File::open(&bin_path)?);
+
+        let base_time = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")?
+            .with_timezone(&chrono::Utc);
+        let mut timestamp_block = std::collections::HashMap::new();
+        let mut timestamps = Vec::new();
+        for block_id in 1_i64..=40 {
+            timestamps.push((base_time + chrono::Duration::hours(block_id - 1), block_id));
+        }
+        timestamp_block.insert("ST__Interval".to_string(), timestamps);
+
+        let dataset = SolutionDataset {
+            file: output_dir.path().join("source.xml"),
+            model_name: "file-period-data".to_string(),
+            key,
+            key_index,
+            period_data: period_data
+                .into_iter()
+                .map(|(period_type_id, file)| (period_type_id, PeriodData::File(file)))
+                .collect(),
+            timestamp_block,
+            table_key_index_mapping,
+            ..Default::default()
+        };
+
+        let db_path = output_dir
+            .path()
+            .join(format!("file_period_threads_{threads}.duckdb"));
+        dataset
+            .to_duckdb(&db_path)
+            .with_data_write_threads(threads)
+            .run()?;
+
+        Ok((output_dir, db_path))
+    }
+
+    fn assert_file_period_data(db_path: &std::path::Path) -> Result<()> {
+        let con = duckdb::Connection::open(db_path)?;
+        for (table_idx, (table_name, expected_values)) in
+            file_period_table_specs().into_iter().enumerate()
+        {
+            let key_id = 100 + i64::try_from(table_idx)?;
+            let sample_id = 200 + i64::try_from(table_idx)?;
+            let band_id = 300 + i64::try_from(table_idx)?;
+            let membership_id = 400 + i64::try_from(table_idx)?;
+            let period_offset = i64::try_from(table_idx)? * 10;
+            let table_ident = SolutionDataset::quote_ident(table_name);
+            let mut stmt = con.prepare(&format!(
+                "SELECT key_id, sample_id, band_id, membership_id, block_id, value
+                 FROM data.{table_ident}
+                 ORDER BY block_id;"
+            ))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, f64>(5)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            assert_eq!(rows.len(), expected_values.len());
+            for (value_idx, row) in rows.into_iter().enumerate() {
+                let expected_block_id = period_offset + i64::try_from(value_idx)? + 1;
+                assert_eq!(row.0, key_id);
+                assert_eq!(row.1, sample_id);
+                assert_eq!(row.2, band_id);
+                assert_eq!(row.3, membership_id);
+                assert_eq!(row.4, expected_block_id);
+                assert_eq!(row.5, expected_values[value_idx]);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn persist_in_memory_mode_uses_copy_and_checkpoint() -> Result<()> {
         let (_output_dir, db_path) = build_small_database(DbWriteMode::InMemoryThenCopy)?;
@@ -4473,6 +4615,18 @@ mod tests {
     fn persist_direct_mode_uses_copy_and_checkpoint() -> Result<()> {
         let (_output_dir, db_path) = build_small_database(DbWriteMode::Direct)?;
         assert_small_database(&db_path)
+    }
+
+    #[test]
+    fn file_period_data_uses_parquet_staging_with_one_thread() -> Result<()> {
+        let (_output_dir, db_path) = write_file_period_data_database(1)?;
+        assert_file_period_data(&db_path)
+    }
+
+    #[test]
+    fn file_period_data_uses_parquet_staging_with_four_threads() -> Result<()> {
+        let (_output_dir, db_path) = write_file_period_data_database(4)?;
+        assert_file_period_data(&db_path)
     }
 
     #[test]
