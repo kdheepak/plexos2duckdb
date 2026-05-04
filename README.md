@@ -7,9 +7,9 @@
 [![Downloads](https://img.shields.io/github/downloads/epri-dev/plexos2duckdb/total?color=brightgreen)](https://github.com/epri-dev/plexos2duckdb/releases)
 
 > [!IMPORTANT]
-> 
-> This software is in **beta pre-production**.
-> Interfaces, behavior, and data format may change without notice before the production release.
+>
+> This software is in **beta pre-production**. Interfaces, behavior, and data format may change
+> without notice before the production release.
 
 `plexos2duckdb` is a software tool to convert PLEXOS solution files to a DuckDB database.
 
@@ -19,7 +19,8 @@
 
 ### Option 1: Install with uv (recommended)
 
-On supported platforms, you can install the command-line tool directly from PyPI using [`uv`](https://github.com/astral-sh/uv):
+On supported platforms, you can install the command-line tool directly from PyPI using
+[`uv`](https://github.com/astral-sh/uv):
 
 ```shell
 uv add --prerelease=allow plexos2duckdb
@@ -92,7 +93,8 @@ Pre-built binaries for the CLI are available from the
 
 > [!NOTE]
 >
-> The following assumes you have installed the CLI tool using one of the methods above and have `plexos2duckdb` in the `PATH` environment variable.
+> The following assumes you have installed the CLI tool using one of the methods above and have
+> `plexos2duckdb` in the `PATH` environment variable.
 
 Verify installation is successful by checking the version:
 
@@ -140,9 +142,11 @@ interactively explore the data with SQL:
 
 ### Python usage
 
-Import the `PLEXOS2DuckDB` class from the `plexos2duckdb` package, create a client instance with the path to your solution zip file, and call the `convert()` method to generate the DuckDB database. 
+Import the `PLEXOS2DuckDB` class from the `plexos2duckdb` package, create a client instance with the
+path to your solution zip file, and call the `convert()` method to generate the DuckDB database.
 
-You can also use the same client as a context manager to interact with the database connection directly.
+You can also use the same client as a context manager to interact with the database connection
+directly.
 
 ```python
 from plexos2duckdb import PLEXOS2DuckDB
