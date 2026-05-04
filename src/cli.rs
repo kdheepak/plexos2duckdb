@@ -54,9 +54,6 @@ pub struct ConvertArgs {
     /// Disable progress bar output
     #[arg(long, default_value_t = false)]
     pub no_progress_bar: bool,
-    /// Stage in memory then copy to disk (faster, but uses more RAM)
-    #[arg(long, default_value_t = false)]
-    pub in_memory: bool,
     /// Number of threads to use when writing time series data tables
     #[arg(long)]
     pub n_threads: Option<std::num::NonZeroUsize>,
@@ -828,12 +825,7 @@ fn convert(args: ConvertArgs) -> Result<()> {
     }
 
     report("Creating DuckDB database");
-    let mode = if args.in_memory {
-        plexos2duckdb::DbWriteMode::InMemoryThenCopy
-    } else {
-        plexos2duckdb::DbWriteMode::Direct
-    };
-    let mut builder = dataset.to_duckdb(&output_path).with_mode(mode);
+    let mut builder = dataset.to_duckdb(&output_path);
     if let Some(threads) = args.n_threads {
         builder = builder.with_data_write_threads(threads.get());
     }

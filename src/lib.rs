@@ -4,7 +4,7 @@
 use std::io::Read as _;
 use std::sync::{Arc, LazyLock};
 
-use color_eyre::{eyre::eyre, Result};
+use color_eyre::{Result, eyre::eyre};
 use duckdb::arrow::{
     array::{ArrayRef, Float64Array, Int64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -785,12 +785,6 @@ enum DuckdbProgress {
     Event(ProgressEvent),
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum DbWriteMode {
-    InMemoryThenCopy,
-    Direct,
-}
-
 #[derive(Debug, Clone)]
 struct DataTableWritePlan {
     table_name: String,
@@ -819,7 +813,6 @@ enum DataWriteWorkerEvent {
 pub struct DuckdbBuilder<'a> {
     dataset: &'a SolutionDataset,
     db_path: std::path::PathBuf,
-    mode: DbWriteMode,
     data_write_threads: Option<usize>,
     deflate_index_interval_bytes: u64,
     report: Option<&'a mut dyn FnMut(&str)>,
@@ -831,17 +824,11 @@ impl<'a> DuckdbBuilder<'a> {
         Self {
             dataset,
             db_path: db_path.as_ref().to_path_buf(),
-            mode: DbWriteMode::InMemoryThenCopy,
             data_write_threads: None,
             deflate_index_interval_bytes: DEFAULT_DEFLATE_INDEX_INTERVAL_MIB * MIB_BYTES,
             report: None,
             progress: None,
         }
-    }
-
-    pub fn with_mode(mut self, mode: DbWriteMode) -> Self {
-        self.mode = mode;
-        self
     }
 
     pub fn with_data_write_threads(mut self, threads: usize) -> Self {
@@ -888,7 +875,6 @@ impl<'a> DuckdbBuilder<'a> {
         self.dataset.to_duckdb_impl(
             &self.db_path,
             combined_opt,
-            self.mode,
             self.data_write_threads,
             self.deflate_index_interval_bytes,
         )
@@ -2056,7 +2042,6 @@ impl SolutionDataset {
         &self,
         db_path: P,
         mut progress: Option<&mut dyn FnMut(DuckdbProgress)>,
-        mode: DbWriteMode,
         data_write_threads: Option<usize>,
         deflate_index_interval_bytes: u64,
     ) -> Result<()> {
@@ -2071,8 +2056,8 @@ impl SolutionDataset {
             total_steps,
             "Initializing DuckDB",
             |_progress| {
-                let (con, stage_dir) = Self::open_duckdb_write_connection(db_path, mode)?;
-                direct_stage_dir = stage_dir;
+                let (con, stage_dir) = Self::open_duckdb_write_connection(db_path)?;
+                direct_stage_dir = Some(stage_dir);
                 Ok(con)
             },
         )?;
@@ -2318,7 +2303,7 @@ impl SolutionDataset {
             &mut step_index,
             total_steps,
             "Persisting DuckDB database",
-            |_progress| Self::persist_duckdb_database(&mut con, db_path, mode),
+            |_progress| Self::persist_duckdb_database(&mut con, db_path),
         )?;
 
         drop(con);
@@ -3246,19 +3231,13 @@ impl SolutionDataset {
 
     fn open_duckdb_write_connection(
         db_path: &std::path::Path,
-        mode: DbWriteMode,
-    ) -> Result<(duckdb::Connection, Option<tempfile::TempDir>)> {
-        match mode {
-            DbWriteMode::InMemoryThenCopy => Ok((duckdb::Connection::open_in_memory()?, None)),
-            DbWriteMode::Direct => {
-                let staging_parent = Self::duckdb_staging_parent(db_path);
-                let staging_dir = tempfile::Builder::new()
-                    .prefix("plexos2duckdb-stage-")
-                    .tempdir_in(staging_parent)?;
-                let staging_path = staging_dir.path().join("stage.duckdb");
-                Ok((duckdb::Connection::open(staging_path)?, Some(staging_dir)))
-            },
-        }
+    ) -> Result<(duckdb::Connection, tempfile::TempDir)> {
+        let staging_parent = Self::duckdb_staging_parent(db_path);
+        let staging_dir = tempfile::Builder::new()
+            .prefix("plexos2duckdb-stage-")
+            .tempdir_in(staging_parent)?;
+        let staging_path = staging_dir.path().join("stage.duckdb");
+        Ok((duckdb::Connection::open(staging_path)?, staging_dir))
     }
 
     fn duckdb_staging_parent(db_path: &std::path::Path) -> std::path::PathBuf {
@@ -3272,17 +3251,13 @@ impl SolutionDataset {
     fn persist_duckdb_database(
         con: &mut duckdb::Connection,
         db_path: &std::path::Path,
-        mode: DbWriteMode,
     ) -> Result<()> {
         let target_catalog_ident = Self::quote_ident("persisted_database");
         let target_db_path = Self::sql_string_literal(db_path.to_string_lossy().as_ref());
         let source_catalog_ident = Self::quote_ident(&Self::current_catalog_name(con)?);
 
         con.execute_batch("PRAGMA force_checkpoint;")?;
-
-        if let DbWriteMode::Direct = mode {
-            con.execute_batch("CHECKPOINT;")?;
-        }
+        con.execute_batch("CHECKPOINT;")?;
 
         con.execute_batch(&format!(
             "
@@ -4416,10 +4391,10 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    fn build_small_database(mode: DbWriteMode) -> Result<(tempfile::TempDir, std::path::PathBuf)> {
+    fn build_small_database() -> Result<(tempfile::TempDir, std::path::PathBuf)> {
         let output_dir = tempfile::TempDir::new()?;
         let db_path = output_dir.path().join("result.duckdb");
-        let (mut con, stage_dir) = SolutionDataset::open_duckdb_write_connection(&db_path, mode)?;
+        let (mut con, stage_dir) = SolutionDataset::open_duckdb_write_connection(&db_path)?;
 
         con.execute_batch(
             "
@@ -4427,7 +4402,7 @@ mod tests {
               INSERT INTO numbers VALUES (1), (2), (3);
             ",
         )?;
-        SolutionDataset::persist_duckdb_database(&mut con, &db_path, mode)?;
+        SolutionDataset::persist_duckdb_database(&mut con, &db_path)?;
 
         drop(con);
         drop(stage_dir);
@@ -4606,14 +4581,8 @@ mod tests {
     }
 
     #[test]
-    fn persist_in_memory_mode_uses_copy_and_checkpoint() -> Result<()> {
-        let (_output_dir, db_path) = build_small_database(DbWriteMode::InMemoryThenCopy)?;
-        assert_small_database(&db_path)
-    }
-
-    #[test]
-    fn persist_direct_mode_uses_copy_and_checkpoint() -> Result<()> {
-        let (_output_dir, db_path) = build_small_database(DbWriteMode::Direct)?;
+    fn persist_database_uses_stage_copy_and_checkpoint() -> Result<()> {
+        let (_output_dir, db_path) = build_small_database()?;
         assert_small_database(&db_path)
     }
 
