@@ -17,7 +17,7 @@ color-eyre = "0.6.5"
 console = "0.16.2"
 ctrlc = "3.5.2"
 dateparser = "0.3.1"
-duckdb = { version = "1.4.4", features = ["bundled", "chrono"] }
+duckdb = { version = "1.10502.0", features = ["bundled", "chrono", "appender-arrow"] }
 indexmap = "2.13.0"
 indicatif = "0.18.4"
 itertools = "0.14.0"
