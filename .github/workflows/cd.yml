@@ -132,6 +132,7 @@ jobs:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-l Rstrtmgr"
         with:
           command: build
+          working-directory: python
           target: ${{ matrix.target }}
           args: >-
             --release --locked --out dist ${{ matrix.sdist && '--sdist' || '' }}
@@ -141,13 +142,13 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           files: |
-            dist/*
+            python/dist/*
 
       - name: Upload Python distributions as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: python-dist-${{ matrix.name }}
-          path: dist/*
+          path: python/dist/*
           if-no-files-found: error
 
   upload-binaries:
