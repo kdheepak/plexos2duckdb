@@ -6,8 +6,8 @@ build-backend = "maturin"
 name = "plexos2duckdb"
 version = "0.1.0b11"
 description = "A command line tool to convert PLEXOS solution files to a DuckDB database."
-readme = "README.md"
-requires-python = ">=3.9"
+readme = "../README.md"
+requires-python = ">=3.12"
 license = "BSD-3-Clause"
 authors = [
     { name = "Dheepak Krishnamurthy", email = "1813121+kdheepak@users.noreply.github.com" }
@@ -38,6 +38,15 @@ Issues = "https://github.com/epri-dev/plexos2duckdb/issues"
 
 [tool.maturin]
 bindings = "bin"
-manifest-path = "Cargo.toml"
-python-source = "python"
+manifest-path = "../Cargo.toml"
+python-source = "."
 strip = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
