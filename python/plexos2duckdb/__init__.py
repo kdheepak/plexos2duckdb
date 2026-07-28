@@ -8,11 +8,11 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 import re
 
-from .api import PLEXOS2DuckDB, PLEXOS2DuckDBError
+from .api import PLEXOS2DuckDB, PLEXOS2DuckDBError, ReportAccessor
 
 
 def _version_from_pyproject() -> str:
-    pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     if not pyproject_path.is_file():
         raise PackageNotFoundError("plexos2duckdb")
 
@@ -40,4 +40,4 @@ except PackageNotFoundError:
     __version__ = _version_from_pyproject()
 
 
-__all__ = ["PLEXOS2DuckDB", "PLEXOS2DuckDBError", "__version__"]
+__all__ = ["PLEXOS2DuckDB", "PLEXOS2DuckDBError", "ReportAccessor", "__version__"]

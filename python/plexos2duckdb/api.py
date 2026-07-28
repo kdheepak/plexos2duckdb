@@ -10,8 +10,95 @@ import duckdb
 from rich.table import Table
 
 
+type ReportTree = dict[str, ReportTree | str]
+
+
 class PLEXOS2DuckDBError(RuntimeError):
     """Raised when the plexos2duckdb CLI returns an error."""
+
+
+def _build_report_tree(view_names: list[str]) -> ReportTree:
+    """Build a Phase → Period → Class → Property view-name hierarchy."""
+    tree: ReportTree = {}
+    # View names in the `report` schema follow the convention
+    # `{Phase}__{Period}__{Class}__{Property}`, e.g. `LT__Interval__Generators__Generation`.
+    _REPORT_VIEW_SEGMENTS = 4
+
+    for view_name in view_names:
+        parts = view_name.split("__")
+        if len(parts) != _REPORT_VIEW_SEGMENTS:
+            continue
+
+        node = tree
+        for segment in parts[:-1]:
+            child = node.setdefault(segment, {})
+            if isinstance(child, str):
+                # Defensive: valid four-segment names should never produce this.
+                raise ValueError(f"Conflicting report path in {view_name!r}")
+            node = child
+
+        node[parts[-1]] = view_name
+
+    return tree
+
+
+class ReportAccessor:
+    """Dot-access wrapper for the ``report`` schema.
+
+    Instances are returned from :attr:`PLEXOS2DuckDB.report` and expose the
+    view hierarchy `Phase.Period.Class.Property`. Intermediate attributes
+    return another :class:`ReportAccessor` scoped to that prefix, and leaf
+    attributes return a :class:`duckdb.DuckDBPyRelation` for the fully
+    qualified view (i.e. ``SELECT * FROM report."{view_name}"``).
+
+    Example:
+
+        >>> with client as db:
+        ...     gen = db.report.LT.Interval.Generators.Generation
+        ...     gen.limit(5).df()
+    """
+
+    __slots__ = ("_connection", "_subtree", "_path")
+
+    def __init__(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        subtree: ReportTree,
+        path: tuple[str, ...] = (),
+    ) -> None:
+        self._connection = connection
+        self._subtree = subtree
+        self._path = path
+
+    def __getattr__(self, name: str) -> ReportAccessor | duckdb.DuckDBPyRelation:
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        try:
+            value = self._subtree[name]
+        except KeyError:
+            location = ".".join(("report", *self._path))
+            available = sorted(self._subtree)
+            raise AttributeError(
+                f"{location} has no attribute {name!r}. Available: {available}"
+            ) from None
+
+        if isinstance(value, dict):
+            return type(self)(
+                self._connection,
+                value,
+                (*self._path, name),
+            )
+
+        quoted = value.replace('"', '""')
+        return self._connection.sql(f'SELECT * FROM report."{quoted}"')
+
+    def __dir__(self) -> list[str]:
+        return sorted(set(super().__dir__()) | self._subtree.keys())
+
+    def __repr__(self) -> str:
+        location = ".".join(("report", *self._path))
+        return f"{type(self).__name__}({location}, keys={sorted(self._subtree)})"
 
 
 class PLEXOS2DuckDB:
@@ -98,6 +185,22 @@ class PLEXOS2DuckDB:
     @property
     def metadata(self) -> Table:
         return self._build_metadata_table(self._load_metadata())
+
+    @property
+    def report(self) -> ReportAccessor:
+        """Dot-access entry point for views in the ``report`` schema.
+
+        Requires an open managed connection (see :meth:`open` or use this
+        client as a context manager). Snapshots the current list of
+        ``report`` views once per access.
+        """
+        connection = self.connection
+        rows = connection.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'report' ORDER BY table_name"
+        ).fetchall()
+        view_names = [row[0] for row in rows]
+        return ReportAccessor(connection, _build_report_tree(view_names))
 
     @property
     def inventory(self) -> Table:
