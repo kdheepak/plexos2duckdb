@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let si = vergen_gitcl::Sysinfo::all_sysinfo();
 
     vergen_gitcl::Emitter::default()
+        .default_on_error()
         .add_instructions(&build)?
         .add_instructions(&cargo)?
         .add_instructions(&gitcl)?
