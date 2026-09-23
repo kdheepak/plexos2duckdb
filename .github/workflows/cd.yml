@@ -156,13 +156,29 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Stage README for source distribution
+      - name: Stage README metadata for source distribution
         if: matrix.sdist
         shell: bash
         run: |
-          cp README.md python/README.md
-          sed -i 's#readme = "../README.md"#readme = "README.md"#' python/pyproject.toml
-          grep -q '^readme = "README.md"$' python/pyproject.toml
+          python - <<'PY'
+          import json
+          import pathlib
+
+          pyproject_path = pathlib.Path("python/pyproject.toml")
+          pyproject = pyproject_path.read_text(encoding="utf-8")
+          readme = json.dumps(pathlib.Path("README.md").read_text(encoding="utf-8"))
+          source = 'readme = "../README.md"'
+          replacement = (
+              'readme = { text = '
+              f'{readme}, content-type = "text/markdown" }}'
+          )
+          if pyproject.count(source) != 1:
+              raise SystemExit(f"expected one {source!r} entry")
+          pyproject_path.write_text(
+              pyproject.replace(source, replacement),
+              encoding="utf-8",
+          )
+          PY
 
       - name: Build Python distributions
         uses: PyO3/maturin-action@v1
