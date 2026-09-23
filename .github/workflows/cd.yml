@@ -90,22 +90,39 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-x86_64
+          - name: linux-x86_64-manylinux2014
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             python-architecture: x64
+            manylinux: "2014"
             sdist: true
 
+          - name: linux-aarch64-manylinux2014
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            python-architecture: x64
+            manylinux: "2014"
+            sdist: false
+
+          # - name: macos-x86_64
+          #   os: macos-15-intel
+          #   target: x86_64-apple-darwin
+          #   python-architecture: x64
+          #   manylinux: "off"
+          #   sdist: false
+
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             python-architecture: arm64
+            manylinux: "off"
             sdist: false
 
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             python-architecture: x64
+            manylinux: "off"
             sdist: false
 
     runs-on: ${{ matrix.os }}
@@ -116,6 +133,7 @@ jobs:
           ref: ${{ env.REF }}
 
       - name: Install Rust (stable)
+        if: runner.os != 'Linux'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -132,10 +150,25 @@ jobs:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-l Rstrtmgr"
         with:
           command: build
+          maturin-version: v1.11.5
           working-directory: python
           target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          rust-toolchain: stable
           args: >-
-            --release --locked --out dist ${{ matrix.sdist && '--sdist' || '' }}
+            --release --locked --compatibility pypi --out dist ${{ matrix.sdist && '--sdist' || ''
+            }}
+
+      - name: Verify manylinux wheel tag
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          wheel="$(find python/dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          case "$(basename "$wheel")" in
+            *manylinux_2_17*|*manylinux2014*) ;;
+            *) echo "Expected a manylinux2014-compatible wheel, got $wheel" >&2; exit 1 ;;
+          esac
 
       - name: Upload Python distributions to GitHub Release
         uses: softprops/action-gh-release@v2
