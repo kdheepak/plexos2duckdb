@@ -1,0 +1,33 @@
+#!/usr/bin/env -S uv run --script
+# [MISE] dir="{{config_root}}"
+# [MISE] description="Check that the Rust and Python package versions match"
+# /// script
+# requires-python = ">=3.12"
+# ///
+
+import pathlib
+import re
+
+import tomllib
+
+root = pathlib.Path.cwd()
+with (root / "Cargo.toml").open("rb") as file:
+    rust_version = tomllib.load(file)["package"]["version"]
+with (root / "python/pyproject.toml").open("rb") as file:
+    python_version = tomllib.load(file)["project"]["version"]
+
+match = re.fullmatch(r"(\d+\.\d+\.\d+)(?:-(alpha|beta|rc)\.(\d+))?", rust_version)
+if match is None:
+    raise SystemExit(f"Unsupported Rust version: {rust_version}")
+
+base, prerelease, number = match.groups()
+expected = base
+if prerelease is not None:
+    suffix = {"alpha": "a", "beta": "b", "rc": "rc"}[prerelease]
+    expected = f"{base}{suffix}{number}"
+
+if python_version != expected:
+    raise SystemExit(
+        f"Version mismatch: Rust {rust_version}, Python {python_version}; expected {expected}"
+    )
+print(f"Versions match: Rust {rust_version}, Python {python_version}")

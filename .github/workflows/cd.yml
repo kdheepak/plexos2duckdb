@@ -44,6 +44,9 @@ jobs:
       - name: Install mise
         uses: jdx/mise-action@v4
 
+      - name: Check package versions
+        run: mise run plexos2duckdb:check-versions
+
       - name: Run test suite
         run: mise run plexos2duckdb:test
 
