@@ -44,6 +44,9 @@ jobs:
       - name: Install mise
         uses: jdx/mise-action@v4
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
       - name: Check package versions
         run: mise run plexos2duckdb:check-versions
 
@@ -147,6 +150,12 @@ jobs:
           python-version: "3.13"
           architecture: ${{ matrix.python-architecture }}
 
+      - name: Cache Rust build
+        if: runner.os != 'Linux'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Build Python distributions
         uses: PyO3/maturin-action@v1
         env:
@@ -220,6 +229,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Upload rust binary to GitHub Release
         uses: taiki-e/upload-rust-binary-action@v1
