@@ -286,6 +286,21 @@ struct KeyIndex {
     period_offset: i64,           // temporal data offset (if any) in stored times
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct TableMetadataCacheKey {
+    phase_id: i64,
+    period_type_id: i64,
+    collection_id: i64,
+    property_id: i64,
+    is_summary: bool,
+}
+
+#[derive(Debug)]
+struct TableMetadata {
+    table_name: String,
+    unit_name: String,
+}
+
 #[derive(Debug, Default, Clone)]
 struct AttributeData {
     object_id: Option<i64>,
@@ -322,15 +337,15 @@ struct Property {
 }
 
 impl Property {
-    fn property_name(&self) -> String {
-        self.name.clone()
+    fn property_name(&self) -> &str {
+        &self.name
     }
 
-    fn summary_name(&self) -> String {
+    fn summary_name(&self) -> &str {
         if self.is_summary {
-            self.summary_name.clone()
+            &self.summary_name
         } else {
-            self.name.clone()
+            &self.name
         }
     }
 }
@@ -1037,68 +1052,22 @@ impl SolutionDataset {
         let doc = Document::parse(xml)?;
 
         let root = doc.root_element();
-        Self::report_progress(&mut report, "Parsing attribute data");
-        self.parse_attribute_data(&root)?;
-        Self::report_progress(&mut report, "Parsing attributes");
-        self.parse_attribute(&root)?;
-        Self::report_progress(&mut report, "Parsing properties");
-        self.parse_property(&root)?;
-        Self::report_progress(&mut report, "Parsing bands");
-        self.parse_band(&root)?;
-        Self::report_progress(&mut report, "Parsing categories");
-        self.parse_category(&root)?;
-        Self::report_progress(&mut report, "Parsing class groups");
-        self.parse_class_group(&root)?;
-        Self::report_progress(&mut report, "Parsing classes");
-        self.parse_classes(&root)?;
-        Self::report_progress(&mut report, "Parsing collections");
-        self.parse_collection(&root)?;
-        Self::report_progress(&mut report, "Parsing config");
-        self.parse_config(&root)?;
-        Self::report_progress(&mut report, "Parsing key indexes");
-        self.parse_key_index(&root)?;
-        Self::report_progress(&mut report, "Parsing keys");
-        self.parse_key(&root)?;
-        Self::report_progress(&mut report, "Parsing memberships");
-        self.parse_membership(&root)?;
-        Self::report_progress(&mut report, "Parsing models");
-        self.parse_models(&root)?;
-        Self::report_progress(&mut report, "Parsing objects");
-        self.parse_object(&root)?;
-        Self::report_progress(&mut report, "Parsing period intervals");
-        self.parse_period0(&root)?;
-        Self::report_progress(&mut report, "Parsing period days");
-        self.parse_period1(&root)?;
-        Self::report_progress(&mut report, "Parsing period weeks");
-        self.parse_period2(&root)?;
-        Self::report_progress(&mut report, "Parsing period months");
-        self.parse_period3(&root)?;
-        Self::report_progress(&mut report, "Parsing period years");
-        self.parse_period4(&root)?;
-        Self::report_progress(&mut report, "Parsing period hours");
-        self.parse_period6(&root)?;
-        Self::report_progress(&mut report, "Parsing period quarters");
-        self.parse_period7(&root)?;
-        Self::report_progress(&mut report, "Parsing phase LT");
-        self.parse_phase1(&root)?;
-        Self::report_progress(&mut report, "Parsing phase PASA");
-        self.parse_phase2(&root)?;
-        Self::report_progress(&mut report, "Parsing phase MT");
-        self.parse_phase3(&root)?;
-        Self::report_progress(&mut report, "Parsing phase ST");
-        self.parse_phase4(&root)?;
-        Self::report_progress(&mut report, "Parsing samples");
-        self.parse_sample(&root)?;
-        Self::report_progress(&mut report, "Parsing sample weights");
-        self.parse_sample_weight(&root)?;
-        Self::report_progress(&mut report, "Parsing timeslices");
-        self.parse_timeslice(&root)?;
-        Self::report_progress(&mut report, "Parsing units");
-        self.parse_unit(&root)?;
-        Self::report_progress(&mut report, "Parsing memo objects");
-        self.parse_memo_object(&root)?;
-        Self::report_progress(&mut report, "Parsing custom columns");
-        self.parse_custom_column(&root)?;
+        self.initialize_xml_record_maps();
+
+        let mut last_tag = None;
+        for record_node in root.children().filter(Node::is_element) {
+            let tag = record_node.tag_name().name();
+            if last_tag != Some(tag) {
+                if let Some(label) = xml_record_progress_label(tag) {
+                    Self::report_progress(&mut report, label);
+                }
+                last_tag = Some(tag);
+            }
+            self.parse_xml_record(tag, &record_node)?;
+        }
+
+        Self::report_progress(&mut report, "Sorting XML records");
+        self.sort_xml_records();
 
         Self::report_progress(&mut report, "Updating property band ids");
         self.update_property_band_id()?;
@@ -1112,655 +1081,637 @@ impl SolutionDataset {
         Ok(self)
     }
 
-    fn parse_models(&mut self, node: &Node) -> Result<()> {
-        for model_node in node.children().filter(|n| n.has_tag_name("t_model")) {
-            let model_id = get_child(&model_node, "model_id")?;
-            let name = get_child(&model_node, "name")?;
-
-            let model = Model { model_id, name };
-            self.model.insert(model.model_id, model);
+    fn initialize_xml_record_maps(&mut self) {
+        for name in [
+            "interval", "day", "week", "month", "year", "hour", "quarter",
+        ] {
+            self.period.entry(name.to_string()).or_default();
         }
-        self.model.sort_keys();
+        for name in ["LT", "PASA", "MT", "ST"] {
+            self.phase.entry(name.to_string()).or_default();
+        }
+    }
+
+    fn parse_xml_record(&mut self, tag: &str, record_node: &Node) -> Result<()> {
+        match tag {
+            "t_attribute_data" => self.parse_attribute_data(record_node),
+            "t_attribute" => self.parse_attribute(record_node),
+            "t_property" => self.parse_property(record_node),
+            "t_band" => self.parse_band(record_node),
+            "t_category" => self.parse_category(record_node),
+            "t_class_group" => self.parse_class_group(record_node),
+            "t_class" => self.parse_class(record_node),
+            "t_collection" => self.parse_collection(record_node),
+            "t_config" => self.parse_config(record_node),
+            "t_key_index" => self.parse_key_index(record_node),
+            "t_key" => self.parse_key(record_node),
+            "t_membership" => self.parse_membership(record_node),
+            "t_model" => self.parse_model(record_node),
+            "t_object" => self.parse_object(record_node),
+            "t_period_0" => self.parse_period0(record_node),
+            "t_period_1" => self.parse_period1(record_node),
+            "t_period_2" => self.parse_period2(record_node),
+            "t_period_3" => self.parse_period3(record_node),
+            "t_period_4" => self.parse_period4(record_node),
+            "t_period_6" => self.parse_period6(record_node),
+            "t_period_7" => self.parse_period7(record_node),
+            "t_phase_1" => self.parse_phase1(record_node),
+            "t_phase_2" => self.parse_phase2(record_node),
+            "t_phase_3" => self.parse_phase3(record_node),
+            "t_phase_4" => self.parse_phase4(record_node),
+            "t_sample" => self.parse_sample(record_node),
+            "t_sample_weight" => self.parse_sample_weight(record_node),
+            "t_timeslice" => self.parse_timeslice(record_node),
+            "t_unit" => self.parse_unit(record_node),
+            "t_memo_object" => self.parse_memo_object(record_node),
+            "t_custom_column" => self.parse_custom_column(record_node),
+            _ => Ok(()),
+        }
+    }
+
+    fn sort_xml_records(&mut self) {
+        sort_index_map_if_needed(&mut self.attribute_data);
+        sort_index_map_if_needed(&mut self.attribute);
+        sort_index_map_if_needed(&mut self.band);
+        sort_index_map_if_needed(&mut self.category);
+        sort_index_map_if_needed(&mut self.class_group);
+        sort_index_map_if_needed(&mut self.class);
+        sort_index_map_if_needed(&mut self.collection);
+        sort_index_map_if_needed(&mut self.membership);
+        sort_index_map_if_needed(&mut self.config);
+        sort_index_map_if_needed(&mut self.key_index);
+        sort_index_map_if_needed(&mut self.key);
+        sort_index_map_if_needed(&mut self.model);
+        sort_index_map_if_needed(&mut self.object);
+        sort_index_map_if_needed(&mut self.property);
+        sort_index_map_if_needed(&mut self.sample);
+        sort_index_map_if_needed(&mut self.sample_weight);
+        sort_index_map_if_needed(&mut self.timeslice);
+        sort_index_map_if_needed(&mut self.unit);
+        sort_index_map_if_needed(&mut self.custom_column);
+
+        for records in self.period.values_mut() {
+            sort_index_map_if_needed(records);
+        }
+        for records in self.phase.values_mut() {
+            sort_index_map_if_needed(records);
+        }
+    }
+
+    fn parse_model(&mut self, model_node: &Node) -> Result<()> {
+        let model_id = get_child(model_node, "model_id")?;
+        let name = get_child(model_node, "name")?;
+
+        let model = Model { model_id, name };
+        self.model.insert(model.model_id, model);
         Ok(())
     }
 
-    fn parse_object(&mut self, node: &Node) -> Result<()> {
-        for object_node in node.children().filter(|n| n.has_tag_name("t_object")) {
-            let class_id = get_child(&object_node, "class_id")?;
-            let name = get_child(&object_node, "name")?;
-            let category_id = get_child(&object_node, "category_id")?;
-            let index = get_child(&object_node, "index")?;
-            let object_id = get_child(&object_node, "object_id")?;
-            let show = get_child(&object_node, "show")?;
-            let guid = get_child(&object_node, "GUID").ok();
+    fn parse_object(&mut self, object_node: &Node) -> Result<()> {
+        let class_id = get_child(object_node, "class_id")?;
+        let name = get_child(object_node, "name")?;
+        let category_id = get_child(object_node, "category_id")?;
+        let index = get_child(object_node, "index")?;
+        let object_id = get_child(object_node, "object_id")?;
+        let show = get_child(object_node, "show")?;
+        let guid = get_child(object_node, "GUID").ok();
 
-            let object = Object {
-                class_id,
-                name,
-                category_id,
-                index,
-                object_id,
-                show,
-                guid,
-            };
-            self.object.insert(object.object_id, object);
-        }
-        self.object.sort_keys();
+        let object = Object {
+            class_id,
+            name,
+            category_id,
+            index,
+            object_id,
+            show,
+            guid,
+        };
+        self.object.insert(object.object_id, object);
         Ok(())
     }
 
-    fn parse_membership(&mut self, node: &Node) -> Result<()> {
-        for membership_node in node.children().filter(|n| n.has_tag_name("t_membership")) {
-            let membership_id = get_child(&membership_node, "membership_id")?;
-            let parent_class_id = get_child(&membership_node, "parent_class_id")?;
-            let child_class_id = get_child(&membership_node, "child_class_id")?;
-            let collection_id = get_child(&membership_node, "collection_id")?;
-            let parent_object_id = get_child(&membership_node, "parent_object_id")?;
-            let child_object_id = get_child(&membership_node, "child_object_id")?;
+    fn parse_membership(&mut self, membership_node: &Node) -> Result<()> {
+        let membership_id = get_child(membership_node, "membership_id")?;
+        let parent_class_id = get_child(membership_node, "parent_class_id")?;
+        let child_class_id = get_child(membership_node, "child_class_id")?;
+        let collection_id = get_child(membership_node, "collection_id")?;
+        let parent_object_id = get_child(membership_node, "parent_object_id")?;
+        let child_object_id = get_child(membership_node, "child_object_id")?;
 
-            let membership = Membership {
-                membership_id,
-                parent_class_id,
-                child_class_id,
-                collection_id,
-                parent_object_id,
-                child_object_id,
-                collection_idx: 0,
-            };
-            self.membership.insert(membership.membership_id, membership);
-        }
-        self.membership.sort_keys();
+        let membership = Membership {
+            membership_id,
+            parent_class_id,
+            child_class_id,
+            collection_id,
+            parent_object_id,
+            child_object_id,
+            collection_idx: 0,
+        };
+        self.membership.insert(membership.membership_id, membership);
         Ok(())
     }
 
-    fn parse_attribute(&mut self, node: &Node) -> Result<()> {
-        for attribute_node in node.children().filter(|n| n.has_tag_name("t_attribute")) {
-            let attribute_id = get_child(&attribute_node, "attribute_id")?;
-            let class_id = get_child(&attribute_node, "class_id")?;
-            let enum_id = get_child(&attribute_node, "enum_id")?;
-            let name = get_child(&attribute_node, "name")?;
-            let description = get_child(&attribute_node, "description")?;
-            let input_mask = get_child(&attribute_node, "input_mask").ok();
-            let lang_id = get_child(&attribute_node, "lang_id")?;
+    fn parse_attribute(&mut self, attribute_node: &Node) -> Result<()> {
+        let attribute_id = get_child(attribute_node, "attribute_id")?;
+        let class_id = get_child(attribute_node, "class_id")?;
+        let enum_id = get_child(attribute_node, "enum_id")?;
+        let name = get_child(attribute_node, "name")?;
+        let description = get_child(attribute_node, "description")?;
+        let input_mask = get_child(attribute_node, "input_mask").ok();
+        let lang_id = get_child(attribute_node, "lang_id")?;
 
-            let attribute = Attribute {
-                attribute_id,
-                class_id,
-                enum_id,
-                name,
-                description,
-                lang_id,
-                input_mask,
-            };
-            self.attribute.insert(attribute.attribute_id, attribute);
-        }
-        self.attribute.sort_keys();
+        let attribute = Attribute {
+            attribute_id,
+            class_id,
+            enum_id,
+            name,
+            description,
+            lang_id,
+            input_mask,
+        };
+        self.attribute.insert(attribute.attribute_id, attribute);
         Ok(())
     }
 
-    fn parse_property(&mut self, node: &Node) -> Result<()> {
-        for property_node in node.children().filter(|n| n.has_tag_name("t_property")) {
-            let property_id = get_child(&property_node, "property_id")?;
-            let name = get_child(&property_node, "name")?;
-            let summary_name = get_child(&property_node, "summary_name")?;
-            let enum_id = get_child(&property_node, "enum_id")?;
-            let unit_id = get_child(&property_node, "unit_id")?;
-            let summary_unit_id = get_child(&property_node, "summary_unit_id")?;
-            let is_multi_band = get_child(&property_node, "is_multi_band")?;
-            let is_period = get_child(&property_node, "is_period")?;
-            let is_summary = get_child(&property_node, "is_summary")?;
-            let collection_id = get_child(&property_node, "collection_id")?;
-            let lang_id = get_child(&property_node, "lang_id")?;
+    fn parse_property(&mut self, property_node: &Node) -> Result<()> {
+        let property_id = get_child(property_node, "property_id")?;
+        let name = get_child(property_node, "name")?;
+        let summary_name = get_child(property_node, "summary_name")?;
+        let enum_id = get_child(property_node, "enum_id")?;
+        let unit_id = get_child(property_node, "unit_id")?;
+        let summary_unit_id = get_child(property_node, "summary_unit_id")?;
+        let is_multi_band = get_child(property_node, "is_multi_band")?;
+        let is_period = get_child(property_node, "is_period")?;
+        let is_summary = get_child(property_node, "is_summary")?;
+        let collection_id = get_child(property_node, "collection_id")?;
+        let lang_id = get_child(property_node, "lang_id")?;
 
-            let property = Property {
-                property_id,
-                name,
-                summary_name,
-                lang_id,
-                enum_id,
-                unit_id,
-                summary_unit_id,
-                is_multi_band,
-                is_period,
-                is_summary,
-                collection_id,
-                band_id: 0,
-            };
-            self.property.insert(property.property_id, property);
-        }
-        self.property.sort_keys();
+        let property = Property {
+            property_id,
+            name,
+            summary_name,
+            lang_id,
+            enum_id,
+            unit_id,
+            summary_unit_id,
+            is_multi_band,
+            is_period,
+            is_summary,
+            collection_id,
+            band_id: 0,
+        };
+        self.property.insert(property.property_id, property);
         Ok(())
     }
 
-    fn parse_config(&mut self, node: &Node) -> Result<()> {
-        for config_node in node.children().filter(|n| n.has_tag_name("t_config")) {
-            let element = get_child(&config_node, "element")?;
-            let value = get_child(&config_node, "value").ok();
+    fn parse_config(&mut self, config_node: &Node) -> Result<()> {
+        let element = get_child(config_node, "element")?;
+        let value = get_child(config_node, "value").ok();
 
-            self.config.insert(element, value);
-        }
-        self.config.sort_keys();
+        self.config.insert(element, value);
         Ok(())
     }
 
-    fn parse_unit(&mut self, node: &Node) -> Result<()> {
-        for node in node.children().filter(|n| n.has_tag_name("t_unit")) {
-            let unit_id = get_child(&node, "unit_id")?;
-            let value = get_child(&node, "value")?;
-            let lang_id = get_child(&node, "lang_id")?;
+    fn parse_unit(&mut self, unit_node: &Node) -> Result<()> {
+        let unit_id = get_child(unit_node, "unit_id")?;
+        let value = get_child(unit_node, "value")?;
+        let lang_id = get_child(unit_node, "lang_id")?;
 
-            let unit = Unit {
-                id: unit_id,
-                value,
-                lang_id,
-            };
-
-            self.unit.insert(unit.id, unit);
-        }
-        self.unit.sort_keys();
+        let unit = Unit {
+            id: unit_id,
+            value,
+            lang_id,
+        };
+        self.unit.insert(unit.id, unit);
         Ok(())
     }
 
-    fn parse_band(&mut self, node: &Node) -> Result<()> {
-        for node in node.children().filter(|n| n.has_tag_name("t_band")) {
-            let band_id = get_child(&node, "band_id")?;
-            self.band.insert(band_id, band_id);
-        }
-        self.band.sort_keys();
+    fn parse_band(&mut self, band_node: &Node) -> Result<()> {
+        let band_id = get_child(band_node, "band_id")?;
+        self.band.insert(band_id, band_id);
         Ok(())
     }
 
-    fn parse_category(&mut self, node: &Node) -> Result<()> {
-        for node in node.children().filter(|n| n.has_tag_name("t_category")) {
-            let category_id = get_child(&node, "category_id")?;
-            let class_id = get_child(&node, "class_id")?;
-            let rank = get_child(&node, "rank")?;
-            let name = get_child(&node, "name")?;
+    fn parse_category(&mut self, category_node: &Node) -> Result<()> {
+        let category_id = get_child(category_node, "category_id")?;
+        let class_id = get_child(category_node, "class_id")?;
+        let rank = get_child(category_node, "rank")?;
+        let name = get_child(category_node, "name")?;
 
-            let category = Category {
-                category_id,
-                class_id,
-                rank,
-                name,
-            };
-            self.category.insert(category.category_id, category);
-        }
-        self.category.sort_keys();
+        let category = Category {
+            category_id,
+            class_id,
+            rank,
+            name,
+        };
+        self.category.insert(category.category_id, category);
         Ok(())
     }
 
-    fn parse_classes(&mut self, node: &Node) -> Result<()> {
-        for class_node in node.children().filter(|n| n.has_tag_name("t_class")) {
-            let class_id = get_child(&class_node, "class_id")?;
-            let name = get_child(&class_node, "name")?;
-            let class_group_id = get_child(&class_node, "class_group_id")?;
-            let lang_id = get_child(&class_node, "lang_id")?;
-            let state = get_child(&class_node, "state").ok();
+    fn parse_class(&mut self, class_node: &Node) -> Result<()> {
+        let class_id = get_child(class_node, "class_id")?;
+        let name = get_child(class_node, "name")?;
+        let class_group_id = get_child(class_node, "class_group_id")?;
+        let lang_id = get_child(class_node, "lang_id")?;
+        let state = get_child(class_node, "state").ok();
 
-            let class = Class {
-                class_id,
-                name,
-                class_group_id,
-                lang_id,
-                state,
-            };
-            self.class.insert(class.class_id, class);
-        }
-        self.class.sort_keys();
+        let class = Class {
+            class_id,
+            name,
+            class_group_id,
+            lang_id,
+            state,
+        };
+        self.class.insert(class.class_id, class);
         Ok(())
     }
 
-    fn parse_class_group(&mut self, node: &Node) -> Result<()> {
-        for class_group_node in node.children().filter(|n| n.has_tag_name("t_class_group")) {
-            let class_group_id = get_child(&class_group_node, "class_group_id")?;
-            let name = get_child(&class_group_node, "name")?;
-            let lang_id = get_child(&class_group_node, "lang_id")?;
-            let state = get_child(&class_group_node, "state").ok();
+    fn parse_class_group(&mut self, class_group_node: &Node) -> Result<()> {
+        let class_group_id = get_child(class_group_node, "class_group_id")?;
+        let name = get_child(class_group_node, "name")?;
+        let lang_id = get_child(class_group_node, "lang_id")?;
+        let state = get_child(class_group_node, "state").ok();
 
-            let class_group = ClassGroup {
-                class_group_id,
-                name,
-                lang_id,
-                state,
-            };
-            self.class_group
-                .insert(class_group.class_group_id, class_group);
-        }
-        self.class_group.sort_keys();
+        let class_group = ClassGroup {
+            class_group_id,
+            name,
+            lang_id,
+            state,
+        };
+        self.class_group
+            .insert(class_group.class_group_id, class_group);
         Ok(())
     }
 
-    fn parse_collection(&mut self, node: &Node) -> Result<()> {
-        for collection_node in node.children().filter(|n| n.has_tag_name("t_collection")) {
-            let collection_id = get_child(&collection_node, "collection_id")?;
-            let parent_class_id = get_child(&collection_node, "parent_class_id")?;
-            let child_class_id = get_child(&collection_node, "child_class_id")?;
-            let name = get_child(&collection_node, "name")?;
-            let complement_name = get_child(&collection_node, "complement_name").ok();
-            let lang_id = get_child(&collection_node, "lang_id")?;
+    fn parse_collection(&mut self, collection_node: &Node) -> Result<()> {
+        let collection_id = get_child(collection_node, "collection_id")?;
+        let parent_class_id = get_child(collection_node, "parent_class_id")?;
+        let child_class_id = get_child(collection_node, "child_class_id")?;
+        let name = get_child(collection_node, "name")?;
+        let complement_name = get_child(collection_node, "complement_name").ok();
+        let lang_id = get_child(collection_node, "lang_id")?;
 
-            let collection = Collection {
-                collection_id,
-                parent_class_id,
-                child_class_id,
-                name,
-                complement_name,
-                lang_id,
-                n_members: 0,
-            };
-            self.collection.insert(collection.collection_id, collection);
-        }
-        self.collection.sort_keys();
+        let collection = Collection {
+            collection_id,
+            parent_class_id,
+            child_class_id,
+            name,
+            complement_name,
+            lang_id,
+            n_members: 0,
+        };
+        self.collection.insert(collection.collection_id, collection);
         Ok(())
     }
 
-    fn parse_key(&mut self, node: &Node) -> Result<()> {
-        for key_node in node.children().filter(|n| n.has_tag_name("t_key")) {
-            let key_id = get_child(&key_node, "key_id")?;
-            let membership_id = get_child(&key_node, "membership_id")?;
-            let model_id = get_child(&key_node, "model_id")?;
-            let phase_id = get_child(&key_node, "phase_id")?;
-            let property_id = get_child(&key_node, "property_id")?;
-            // period_type_id is 0 or 1
-            // 1 for summary keys and 0 for non-summary keys
-            let period_type_id: i64 = get_child(&key_node, "period_type_id")?;
-            let band_id = get_child(&key_node, "band_id")?;
-            let sample_id = get_child(&key_node, "sample_id")?;
-            let timeslice_id = get_child(&key_node, "timeslice_id")?;
+    fn parse_key(&mut self, key_node: &Node) -> Result<()> {
+        let mut key_id: Option<i64> = None;
+        let mut membership_id: Option<i64> = None;
+        let mut model_id: Option<i64> = None;
+        let mut phase_id: Option<i64> = None;
+        let mut property_id: Option<i64> = None;
+        let mut period_type_id: Option<i64> = None;
+        let mut band_id: Option<i64> = None;
+        let mut sample_id: Option<i64> = None;
+        let mut timeslice_id: Option<i64> = None;
 
-            let key = Key {
-                key_id,
-                membership_id,
-                model_id,
-                phase_id,
-                property_id,
-                is_summary: period_type_id == 1,
-                band_id,
-                sample_id,
-                timeslice_id,
-            };
-            self.key.insert(key.key_id, key);
+        for child in key_node.children().filter(Node::is_element) {
+            match child.tag_name().name() {
+                "key_id" if key_id.is_none() => key_id = Some(parse_element_text(&child)?),
+                "membership_id" if membership_id.is_none() => {
+                    membership_id = Some(parse_element_text(&child)?)
+                },
+                "model_id" if model_id.is_none() => model_id = Some(parse_element_text(&child)?),
+                "phase_id" if phase_id.is_none() => phase_id = Some(parse_element_text(&child)?),
+                "property_id" if property_id.is_none() => {
+                    property_id = Some(parse_element_text(&child)?)
+                },
+                "period_type_id" if period_type_id.is_none() => {
+                    period_type_id = Some(parse_element_text(&child)?)
+                },
+                "band_id" if band_id.is_none() => band_id = Some(parse_element_text(&child)?),
+                "sample_id" if sample_id.is_none() => sample_id = Some(parse_element_text(&child)?),
+                "timeslice_id" if timeslice_id.is_none() => {
+                    timeslice_id = Some(parse_element_text(&child)?)
+                },
+                _ => {},
+            }
         }
 
-        self.key.sort_keys();
-
+        let period_type_id = required_xml_field(period_type_id, "period_type_id", key_node)?;
+        let key = Key {
+            key_id: required_xml_field(key_id, "key_id", key_node)?,
+            membership_id: required_xml_field(membership_id, "membership_id", key_node)?,
+            model_id: required_xml_field(model_id, "model_id", key_node)?,
+            phase_id: required_xml_field(phase_id, "phase_id", key_node)?,
+            property_id: required_xml_field(property_id, "property_id", key_node)?,
+            is_summary: period_type_id == 1,
+            band_id: required_xml_field(band_id, "band_id", key_node)?,
+            sample_id: required_xml_field(sample_id, "sample_id", key_node)?,
+            timeslice_id: required_xml_field(timeslice_id, "timeslice_id", key_node)?,
+        };
+        self.key.insert(key.key_id, key);
         Ok(())
     }
 
-    fn parse_key_index(&mut self, node: &Node) -> Result<()> {
-        for key_index_node in node.children().filter(|n| n.has_tag_name("t_key_index")) {
-            let key_id = get_child(&key_index_node, "key_id")?;
-            let period_type_id = get_child(&key_index_node, "period_type_id")?;
-            let position = get_child(&key_index_node, "position")?;
-            let length = get_child(&key_index_node, "length")?;
-            let period_offset = get_child(&key_index_node, "period_offset")?;
+    fn parse_key_index(&mut self, key_index_node: &Node) -> Result<()> {
+        let mut key_id: Option<i64> = None;
+        let mut period_type_id: Option<i64> = None;
+        let mut position: Option<u64> = None;
+        let mut length: Option<u64> = None;
+        let mut period_offset: Option<i64> = None;
 
-            let key_index = KeyIndex {
-                key_id,
-                period_type_id,
-                position,
-                length,
-                period_offset,
-            };
-            self.key_index.insert(key_index.key_id, key_index);
+        for child in key_index_node.children().filter(Node::is_element) {
+            match child.tag_name().name() {
+                "key_id" if key_id.is_none() => key_id = Some(parse_element_text(&child)?),
+                "period_type_id" if period_type_id.is_none() => {
+                    period_type_id = Some(parse_element_text(&child)?)
+                },
+                "position" if position.is_none() => position = Some(parse_element_text(&child)?),
+                "length" if length.is_none() => length = Some(parse_element_text(&child)?),
+                "period_offset" if period_offset.is_none() => {
+                    period_offset = Some(parse_element_text(&child)?)
+                },
+                _ => {},
+            }
         }
-        self.key_index.sort_keys();
 
+        let key_index = KeyIndex {
+            key_id: required_xml_field(key_id, "key_id", key_index_node)?,
+            period_type_id: required_xml_field(period_type_id, "period_type_id", key_index_node)?,
+            position: required_xml_field(position, "position", key_index_node)?,
+            length: required_xml_field(length, "length", key_index_node)?,
+            period_offset: required_xml_field(period_offset, "period_offset", key_index_node)?,
+        };
+        self.key_index.insert(key_index.key_id, key_index);
         Ok(())
     }
 
-    fn parse_period0(&mut self, node: &Node) -> Result<()> {
-        for period_node in node.children().filter(|n| n.has_tag_name("t_period_0")) {
-            let interval_id = get_child(&period_node, "interval_id")?;
-            let hour_id = get_child(&period_node, "hour_id")?;
-            let day_id = get_child(&period_node, "day_id")?;
-            let week_id = get_child(&period_node, "week_id")?;
-            let month_id = get_child(&period_node, "month_id")?;
-            let fiscal_year_id = get_child(&period_node, "fiscal_year_id")?;
-            let datetime: String = get_child(&period_node, "datetime")?;
-            let datetime = chrono::DateTime::parse_from_str(
-                &format!("{datetime} +0000"),
-                "%d/%m/%Y %H:%M:%S %z",
-            )?
-            .into();
-            let period_of_day = get_child(&period_node, "period_of_day")?;
-            let quarter_id = get_child(&period_node, "quarter_id").ok();
+    fn parse_period0(&mut self, period_node: &Node) -> Result<()> {
+        let interval_id = get_child(period_node, "interval_id")?;
+        let hour_id = get_child(period_node, "hour_id")?;
+        let day_id = get_child(period_node, "day_id")?;
+        let week_id = get_child(period_node, "week_id")?;
+        let month_id = get_child(period_node, "month_id")?;
+        let fiscal_year_id = get_child(period_node, "fiscal_year_id")?;
+        let datetime: String = get_child(period_node, "datetime")?;
+        let datetime =
+            chrono::DateTime::parse_from_str(&format!("{datetime} +0000"), "%d/%m/%Y %H:%M:%S %z")?
+                .into();
+        let period_of_day = get_child(period_node, "period_of_day")?;
+        let quarter_id = get_child(period_node, "quarter_id").ok();
 
-            let period0 = Period0 {
-                interval_id,
-                hour_id,
-                day_id,
-                week_id,
-                month_id,
-                fiscal_year_id,
-                datetime,
-                period_of_day,
-                quarter_id,
-            };
-            self.period
-                .entry("interval".to_string())
-                .or_default()
-                .insert(period0.interval_id, PeriodType::Interval(period0));
-        }
+        let period = Period0 {
+            interval_id,
+            hour_id,
+            day_id,
+            week_id,
+            month_id,
+            fiscal_year_id,
+            datetime,
+            period_of_day,
+            quarter_id,
+        };
         self.period
-            .entry("interval".to_string())
-            .or_default()
-            .sort_keys();
+            .get_mut("interval")
+            .expect("interval records initialized")
+            .insert(period.interval_id, PeriodType::Interval(period));
         Ok(())
     }
 
-    fn parse_period1(&mut self, node: &Node) -> Result<()> {
-        for period_node in node.children().filter(|n| n.has_tag_name("t_period_1")) {
-            let day_id = get_child(&period_node, "day_id")?;
-            let date: String = get_child(&period_node, "date")?;
-            let date = parse_datetime_to_utc(&date)?;
-            let week_id = get_child(&period_node, "week_id")?;
-            let month_id = get_child(&period_node, "month_id")?;
-            let fiscal_year_id = get_child(&period_node, "fiscal_year_id")?;
-            let quarter_id = get_child(&period_node, "quarter_id").ok();
-            let period1 = Period1 {
-                day_id,
-                date,
-                week_id,
-                month_id,
-                fiscal_year_id,
-                quarter_id,
-            };
+    fn parse_period1(&mut self, period_node: &Node) -> Result<()> {
+        let day_id = get_child(period_node, "day_id")?;
+        let date: String = get_child(period_node, "date")?;
+        let date = parse_datetime_to_utc(&date)?;
+        let week_id = get_child(period_node, "week_id")?;
+        let month_id = get_child(period_node, "month_id")?;
+        let fiscal_year_id = get_child(period_node, "fiscal_year_id")?;
+        let quarter_id = get_child(period_node, "quarter_id").ok();
+        let period = Period1 {
+            day_id,
+            date,
+            week_id,
+            month_id,
+            fiscal_year_id,
+            quarter_id,
+        };
 
-            self.period
-                .entry("day".to_string())
-                .or_default()
-                .insert(period1.day_id, PeriodType::Day(period1));
-        }
         self.period
-            .entry("day".to_string())
-            .or_default()
-            .sort_keys();
+            .get_mut("day")
+            .expect("day records initialized")
+            .insert(period.day_id, PeriodType::Day(period));
         Ok(())
     }
 
-    fn parse_period2(&mut self, node: &Node) -> Result<()> {
-        for period_node in node.children().filter(|n| n.has_tag_name("t_period_2")) {
-            let week_id = get_child(&period_node, "week_id")?;
-            let week_ending: String = get_child(&period_node, "week_ending")?;
-            let week_ending = parse_datetime_to_utc(&week_ending)?;
-            let period2 = Period2 {
-                week_id,
-                week_ending,
-            };
-            self.period
-                .entry("week".to_string())
-                .or_default()
-                .insert(period2.week_id, PeriodType::Week(period2));
-        }
+    fn parse_period2(&mut self, period_node: &Node) -> Result<()> {
+        let week_id = get_child(period_node, "week_id")?;
+        let week_ending: String = get_child(period_node, "week_ending")?;
+        let week_ending = parse_datetime_to_utc(&week_ending)?;
+        let period = Period2 {
+            week_id,
+            week_ending,
+        };
         self.period
-            .entry("week".to_string())
-            .or_default()
-            .sort_keys();
+            .get_mut("week")
+            .expect("week records initialized")
+            .insert(period.week_id, PeriodType::Week(period));
         Ok(())
     }
 
-    fn parse_period3(&mut self, node: &Node) -> Result<()> {
-        for period_node in node.children().filter(|n| n.has_tag_name("t_period_3")) {
-            let month_id = get_child(&period_node, "month_id")?;
-            let month_beginning: String = get_child(&period_node, "month_beginning")?;
-            let month_beginning = parse_datetime_to_utc(&month_beginning)?;
-            let period3 = Period3 {
-                month_id,
-                month_beginning,
-            };
-            self.period
-                .entry("month".to_string())
-                .or_default()
-                .insert(period3.month_id, PeriodType::Month(period3));
-        }
+    fn parse_period3(&mut self, period_node: &Node) -> Result<()> {
+        let month_id = get_child(period_node, "month_id")?;
+        let month_beginning: String = get_child(period_node, "month_beginning")?;
+        let month_beginning = parse_datetime_to_utc(&month_beginning)?;
+        let period = Period3 {
+            month_id,
+            month_beginning,
+        };
         self.period
-            .entry("month".to_string())
-            .or_default()
-            .sort_keys();
+            .get_mut("month")
+            .expect("month records initialized")
+            .insert(period.month_id, PeriodType::Month(period));
         Ok(())
     }
 
-    fn parse_period4(&mut self, node: &Node) -> Result<()> {
-        for period_node in node.children().filter(|n| n.has_tag_name("t_period_4")) {
-            let fiscal_year_id = get_child(&period_node, "fiscal_year_id")?;
-            let year_ending: String = get_child(&period_node, "year_ending")?;
-            let year_ending = parse_datetime_to_utc(&year_ending)?;
-            let period4 = Period4 {
-                fiscal_year_id,
-                year_ending,
-            };
-            self.period
-                .entry("year".to_string())
-                .or_default()
-                .insert(period4.fiscal_year_id, PeriodType::Year(period4));
-        }
+    fn parse_period4(&mut self, period_node: &Node) -> Result<()> {
+        let fiscal_year_id = get_child(period_node, "fiscal_year_id")?;
+        let year_ending: String = get_child(period_node, "year_ending")?;
+        let year_ending = parse_datetime_to_utc(&year_ending)?;
+        let period = Period4 {
+            fiscal_year_id,
+            year_ending,
+        };
         self.period
-            .entry("year".to_string())
-            .or_default()
-            .sort_keys();
+            .get_mut("year")
+            .expect("year records initialized")
+            .insert(period.fiscal_year_id, PeriodType::Year(period));
         Ok(())
     }
 
-    fn parse_period6(&mut self, node: &Node) -> Result<()> {
-        for period_node in node.children().filter(|n| n.has_tag_name("t_period_6")) {
-            let hour_id = get_child(&period_node, "hour_id")?;
-            let datetime: String = get_child(&period_node, "datetime")?;
-            let datetime = parse_datetime_to_utc(&datetime)?;
-            let period6 = Period6 { hour_id, datetime };
-            self.period
-                .entry("hour".to_string())
-                .or_default()
-                .insert(period6.hour_id, PeriodType::Hour(period6));
-        }
+    fn parse_period6(&mut self, period_node: &Node) -> Result<()> {
+        let hour_id = get_child(period_node, "hour_id")?;
+        let datetime: String = get_child(period_node, "datetime")?;
+        let datetime = parse_datetime_to_utc(&datetime)?;
+        let period = Period6 { hour_id, datetime };
         self.period
-            .entry("hour".to_string())
-            .or_default()
-            .sort_keys();
+            .get_mut("hour")
+            .expect("hour records initialized")
+            .insert(period.hour_id, PeriodType::Hour(period));
         Ok(())
     }
 
-    fn parse_period7(&mut self, node: &Node) -> Result<()> {
-        for period_node in node.children().filter(|n| n.has_tag_name("t_period_7")) {
-            let quarter_id = get_child(&period_node, "quarter_id")?;
-            let quarter_beginning: String = get_child(&period_node, "quarter_beginning")?;
-            let quarter_beginning = parse_datetime_to_utc(&quarter_beginning)?;
-            let period7 = Period7 {
-                quarter_id,
-                quarter_beginning,
-            };
-            self.period
-                .entry("quarter".to_string())
-                .or_default()
-                .insert(period7.quarter_id, PeriodType::Quarter(period7));
-        }
+    fn parse_period7(&mut self, period_node: &Node) -> Result<()> {
+        let quarter_id = get_child(period_node, "quarter_id")?;
+        let quarter_beginning: String = get_child(period_node, "quarter_beginning")?;
+        let quarter_beginning = parse_datetime_to_utc(&quarter_beginning)?;
+        let period = Period7 {
+            quarter_id,
+            quarter_beginning,
+        };
         self.period
-            .entry("quarter".to_string())
-            .or_default()
-            .sort_keys();
+            .get_mut("quarter")
+            .expect("quarter records initialized")
+            .insert(period.quarter_id, PeriodType::Quarter(period));
         Ok(())
     }
 
-    fn parse_phase1(&mut self, node: &Node) -> Result<()> {
-        for phase_node in node.children().filter(|n| n.has_tag_name("t_phase_1")) {
-            let interval_id = get_child(&phase_node, "interval_id")?;
-            let period_id = get_child(&phase_node, "period_id")?;
+    fn parse_phase1(&mut self, phase_node: &Node) -> Result<()> {
+        let interval_id = get_child(phase_node, "interval_id")?;
+        let period_id = get_child(phase_node, "period_id")?;
 
-            let phase1 = Phase1 {
-                interval_id,
-                period_id,
-            };
-            self.phase
-                .entry("LT".to_string())
-                .or_default()
-                .insert(phase1.interval_id, PhaseType::LT(phase1));
-        }
-        self.phase.entry("LT".to_string()).or_default().sort_keys();
-        Ok(())
-    }
-
-    fn parse_phase2(&mut self, node: &Node) -> Result<()> {
-        for phase_node in node.children().filter(|n| n.has_tag_name("t_phase_2")) {
-            let interval_id = get_child(&phase_node, "interval_id")?;
-            let period_id = get_child(&phase_node, "period_id")?;
-
-            let phase2 = Phase2 {
-                interval_id,
-                period_id,
-            };
-            self.phase
-                .entry("PASA".to_string())
-                .or_default()
-                .insert(phase2.interval_id, PhaseType::PASA(phase2));
-        }
+        let phase = Phase1 {
+            interval_id,
+            period_id,
+        };
         self.phase
-            .entry("PASA".to_string())
-            .or_default()
-            .sort_keys();
+            .get_mut("LT")
+            .expect("LT records initialized")
+            .insert(phase.interval_id, PhaseType::LT(phase));
         Ok(())
     }
 
-    fn parse_phase3(&mut self, node: &Node) -> Result<()> {
-        for phase_node in node.children().filter(|n| n.has_tag_name("t_phase_3")) {
-            let interval_id = get_child(&phase_node, "interval_id")?;
-            let period_id = get_child(&phase_node, "period_id")?;
+    fn parse_phase2(&mut self, phase_node: &Node) -> Result<()> {
+        let interval_id = get_child(phase_node, "interval_id")?;
+        let period_id = get_child(phase_node, "period_id")?;
 
-            let phase3 = Phase3 {
-                interval_id,
-                period_id,
-            };
-            self.phase
-                .entry("MT".to_string())
-                .or_default()
-                .insert(phase3.interval_id, PhaseType::MT(phase3));
-        }
-        self.phase.entry("MT".to_string()).or_default().sort_keys();
+        let phase = Phase2 {
+            interval_id,
+            period_id,
+        };
+        self.phase
+            .get_mut("PASA")
+            .expect("PASA records initialized")
+            .insert(phase.interval_id, PhaseType::PASA(phase));
         Ok(())
     }
 
-    fn parse_phase4(&mut self, node: &Node) -> Result<()> {
-        for phase_node in node.children().filter(|n| n.has_tag_name("t_phase_4")) {
-            let interval_id = get_child(&phase_node, "interval_id")?;
-            let period_id = get_child(&phase_node, "period_id")?;
+    fn parse_phase3(&mut self, phase_node: &Node) -> Result<()> {
+        let interval_id = get_child(phase_node, "interval_id")?;
+        let period_id = get_child(phase_node, "period_id")?;
 
-            let phase4 = Phase4 {
-                interval_id,
-                period_id,
-            };
-            self.phase
-                .entry("ST".to_string())
-                .or_default()
-                .insert(phase4.interval_id, PhaseType::ST(phase4));
-        }
-        self.phase.entry("ST".to_string()).or_default().sort_keys();
+        let phase = Phase3 {
+            interval_id,
+            period_id,
+        };
+        self.phase
+            .get_mut("MT")
+            .expect("MT records initialized")
+            .insert(phase.interval_id, PhaseType::MT(phase));
         Ok(())
     }
 
-    fn parse_sample(&mut self, node: &Node) -> Result<()> {
-        for sample_node in node.children().filter(|n| n.has_tag_name("t_sample")) {
-            let id = get_child(&sample_node, "sample_id")?;
-            let name = get_child(&sample_node, "sample_name").ok();
+    fn parse_phase4(&mut self, phase_node: &Node) -> Result<()> {
+        let interval_id = get_child(phase_node, "interval_id")?;
+        let period_id = get_child(phase_node, "period_id")?;
 
-            let sample = Sample {
-                sample_id: id,
-                name,
-            };
-            self.sample.insert(sample.sample_id, sample);
-        }
-        self.sample.sort_keys();
+        let phase = Phase4 {
+            interval_id,
+            period_id,
+        };
+        self.phase
+            .get_mut("ST")
+            .expect("ST records initialized")
+            .insert(phase.interval_id, PhaseType::ST(phase));
         Ok(())
     }
 
-    fn parse_sample_weight(&mut self, node: &Node) -> Result<()> {
-        for sample_weight_node in node
-            .children()
-            .filter(|n| n.has_tag_name("t_sample_weight"))
-        {
-            let sample_id = get_child(&sample_weight_node, "sample_id")?;
-            let phase_id = get_child(&sample_weight_node, "phase_id")?;
-            let weight = get_child(&sample_weight_node, "value")?;
+    fn parse_sample(&mut self, sample_node: &Node) -> Result<()> {
+        let id = get_child(sample_node, "sample_id")?;
+        let name = get_child(sample_node, "sample_name").ok();
 
-            let sample_weight = SampleWeight {
-                sample_id,
-                phase_id,
-                weight,
-            };
-            self.sample_weight
-                .insert(sample_weight.sample_id, sample_weight);
-        }
-        self.sample_weight.sort_keys();
+        let sample = Sample {
+            sample_id: id,
+            name,
+        };
+        self.sample.insert(sample.sample_id, sample);
         Ok(())
     }
 
-    fn parse_timeslice(&mut self, node: &Node) -> Result<()> {
-        for timeslice_node in node.children().filter(|n| n.has_tag_name("t_timeslice")) {
-            let timeslice_id = get_child(&timeslice_node, "timeslice_id")?;
-            let name = get_child(&timeslice_node, "name")?;
+    fn parse_sample_weight(&mut self, sample_weight_node: &Node) -> Result<()> {
+        let sample_id = get_child(sample_weight_node, "sample_id")?;
+        let phase_id = get_child(sample_weight_node, "phase_id")?;
+        let weight = get_child(sample_weight_node, "value")?;
 
-            let timeslice = Timeslice { timeslice_id, name };
-            self.timeslice.insert(timeslice.timeslice_id, timeslice);
-        }
-        self.timeslice.sort_keys();
+        let sample_weight = SampleWeight {
+            sample_id,
+            phase_id,
+            weight,
+        };
+        self.sample_weight
+            .insert(sample_weight.sample_id, sample_weight);
         Ok(())
     }
 
-    fn parse_attribute_data(&mut self, node: &Node) -> Result<()> {
-        for attribute_node in node
-            .children()
-            .filter(|n| n.has_tag_name("t_attribute_data"))
-        {
-            let object_id = get_child(&attribute_node, "object_id").ok();
-            let attribute_id = get_child(&attribute_node, "attribute_id")?;
-            let value = get_child(&attribute_node, "value")?;
+    fn parse_timeslice(&mut self, timeslice_node: &Node) -> Result<()> {
+        let timeslice_id = get_child(timeslice_node, "timeslice_id")?;
+        let name = get_child(timeslice_node, "name")?;
 
-            let attribute_data = AttributeData {
-                object_id,
-                attribute_id,
-                value,
-            };
-            self.attribute_data
-                .insert(attribute_data.attribute_id, attribute_data);
-        }
-        self.attribute_data.sort_keys();
+        let timeslice = Timeslice { timeslice_id, name };
+        self.timeslice.insert(timeslice.timeslice_id, timeslice);
         Ok(())
     }
 
-    fn parse_memo_object(&mut self, node: &Node) -> Result<()> {
-        for memo_node in node.children().filter(|n| n.has_tag_name("t_memo_object")) {
-            let value = get_child(&memo_node, "value")?;
-            let column_id = get_child(&memo_node, "column_id")?;
-            let object_id = get_child(&memo_node, "object_id")?;
+    fn parse_attribute_data(&mut self, attribute_node: &Node) -> Result<()> {
+        let object_id = get_child(attribute_node, "object_id").ok();
+        let attribute_id = get_child(attribute_node, "attribute_id")?;
+        let value = get_child(attribute_node, "value")?;
 
-            let memo_object = MemoObject {
-                value,
-                column_id,
-                object_id,
-            };
-            self.memo_object.push(memo_object);
-        }
-
+        let attribute_data = AttributeData {
+            object_id,
+            attribute_id,
+            value,
+        };
+        self.attribute_data
+            .insert(attribute_data.attribute_id, attribute_data);
         Ok(())
     }
 
-    fn parse_custom_column(&mut self, node: &Node) -> Result<()> {
-        for custom_column_node in node
-            .children()
-            .filter(|n| n.has_tag_name("t_custom_column"))
-        {
-            let column_id = get_child(&custom_column_node, "column_id")?;
-            let name = get_child(&custom_column_node, "name")?;
-            let position = get_child(&custom_column_node, "position")?;
-            let class_id = get_child(&custom_column_node, "class_id")?;
-            let custom_column = CustomColumn {
-                column_id,
-                name,
-                position,
-                class_id,
-            };
-            self.custom_column
-                .insert(custom_column.column_id, custom_column);
-        }
-        self.custom_column.sort_keys();
+    fn parse_memo_object(&mut self, memo_node: &Node) -> Result<()> {
+        let value = get_child(memo_node, "value")?;
+        let column_id = get_child(memo_node, "column_id")?;
+        let object_id = get_child(memo_node, "object_id")?;
+
+        let memo_object = MemoObject {
+            value,
+            column_id,
+            object_id,
+        };
+        self.memo_object.push(memo_object);
+        Ok(())
+    }
+
+    fn parse_custom_column(&mut self, custom_column_node: &Node) -> Result<()> {
+        let column_id = get_child(custom_column_node, "column_id")?;
+        let name = get_child(custom_column_node, "name")?;
+        let position = get_child(custom_column_node, "position")?;
+        let class_id = get_child(custom_column_node, "class_id")?;
+        let custom_column = CustomColumn {
+            column_id,
+            name,
+            position,
+            class_id,
+        };
+        self.custom_column
+            .insert(custom_column.column_id, custom_column);
         Ok(())
     }
 
@@ -1842,43 +1793,71 @@ impl SolutionDataset {
             Default::default();
         let mut units_mapping: std::collections::HashMap<String, (String, i64)> =
             Default::default();
+        let mut metadata_cache: std::collections::HashMap<TableMetadataCacheKey, TableMetadata> =
+            Default::default();
 
         for ki in self.key_index.values() {
             let key_id = ki.key_id;
             let key = self.key(key_id)?;
-
-            let phase_id = key.phase_id;
-            let period_type_id = ki.period_type_id;
-            let phase_name = self.phase_name(phase_id);
-            let period_name = self.period_name(period_type_id);
             let membership = self.membership(key.membership_id)?;
-            let collection = self.collection(membership.collection_id)?;
-            let property = self.property(key.property_id)?;
-            let collection_name = collection.name.clone();
-            let property_name = if key.is_summary {
-                property.summary_name()
-            } else {
-                property.property_name()
+            let cache_key = TableMetadataCacheKey {
+                phase_id: key.phase_id,
+                period_type_id: ki.period_type_id,
+                collection_id: membership.collection_id,
+                property_id: key.property_id,
+                is_summary: key.is_summary,
             };
-            let unit_id = if property.is_summary {
-                property.summary_unit_id
-            } else {
-                property.unit_id
-            };
-            let unit = self.unit(unit_id)?;
-            let unit_name = unit.value.clone();
-            let period_offset = ki.period_offset;
 
-            let table_name =
-                format!("{phase_name}__{period_name}__{collection_name}__{property_name}")
+            let metadata = match metadata_cache.entry(cache_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let phase_name = self.phase_name(cache_key.phase_id);
+                    let period_name = self.period_name(cache_key.period_type_id);
+                    let collection = self.collection(cache_key.collection_id)?;
+                    let property = self.property(cache_key.property_id)?;
+                    let property_name = if cache_key.is_summary {
+                        property.summary_name()
+                    } else {
+                        property.property_name()
+                    };
+                    let unit_id = if property.is_summary {
+                        property.summary_unit_id
+                    } else {
+                        property.unit_id
+                    };
+                    let unit = self.unit(unit_id)?;
+                    let table_name = format!(
+                        "{phase_name}__{period_name}__{}__{property_name}",
+                        collection.name
+                    )
                     .replace(" ", "_")
                     .replace("-", "_");
 
-            key_indexes_mapping
-                .entry(table_name.clone())
-                .or_default()
-                .push(key_id);
-            units_mapping.insert(table_name, (unit_name, period_offset));
+                    entry.insert(TableMetadata {
+                        table_name,
+                        unit_name: unit.value.clone(),
+                    })
+                },
+            };
+            if let Some(key_ids) = key_indexes_mapping.get_mut(metadata.table_name.as_str()) {
+                key_ids.push(key_id);
+            } else {
+                key_indexes_mapping.insert(metadata.table_name.clone(), vec![key_id]);
+            }
+
+            if let Some((unit_name, period_offset)) =
+                units_mapping.get_mut(metadata.table_name.as_str())
+            {
+                if unit_name != &metadata.unit_name {
+                    unit_name.clone_from(&metadata.unit_name);
+                }
+                *period_offset = ki.period_offset;
+            } else {
+                units_mapping.insert(
+                    metadata.table_name.clone(),
+                    (metadata.unit_name.clone(), ki.period_offset),
+                );
+            }
         }
         self.table_key_index_mapping = key_indexes_mapping;
         self.table_units_mapping = units_mapping;
@@ -2287,15 +2266,24 @@ impl SolutionDataset {
         )?;
 
         let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
-        self.populate_table_data_uncompressed_parquet(
-            con,
-            plans,
-            worker_count,
-            staging_parent.as_path(),
-            external_data_parquet_dir.as_deref(),
-            materialized_period_data.as_ref(),
-            progress,
-        )
+        if let Some(external_data_parquet_dir) = external_data_parquet_dir.as_deref() {
+            self.populate_table_data_external_parquet(
+                con,
+                plans,
+                worker_count,
+                external_data_parquet_dir,
+                materialized_period_data.as_ref(),
+                progress,
+            )
+        } else {
+            self.populate_table_data_direct(
+                con,
+                plans,
+                worker_count,
+                materialized_period_data.as_ref(),
+                progress,
+            )
+        }
     }
 
     fn data_table_name_matches(
@@ -2432,13 +2420,11 @@ impl SolutionDataset {
         )))
     }
 
-    fn populate_table_data_uncompressed_parquet(
+    fn populate_table_data_direct(
         &self,
-        con: &mut duckdb::Connection,
+        con: &duckdb::Connection,
         plans: Vec<DataTableWritePlan>,
         worker_count: usize,
-        staging_parent: &std::path::Path,
-        external_data_parquet_dir: Option<&std::path::Path>,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
@@ -2447,35 +2433,191 @@ impl SolutionDataset {
         Self::report_duckdb_progress(
             progress,
             &format!(
-                "Writing uncompressed BIN tables with {} workers",
+                "Writing BIN tables directly to DuckDB with {} workers",
                 worker_plans.len()
             ),
         );
 
-        let mut staging_dir = None;
-        let (parquet_root, external_layout) = if let Some(external_dir) = external_data_parquet_dir
-        {
-            std::fs::create_dir_all(external_dir)?;
-            let external_dir = external_dir.canonicalize()?;
-            std::fs::create_dir_all(external_dir.join("data"))?;
-            (external_dir, true)
-        } else {
-            let dir = tempfile::Builder::new()
-                .prefix("plexos2duckdb-data-parquet-")
-                .tempdir_in(staging_parent)?;
-            let path = dir.path().to_path_buf();
-            staging_dir = Some(dir);
-            (path, false)
-        };
+        let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
+        std::thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::with_capacity(worker_plans.len());
+            for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
+                let worker_tx = tx.clone();
+                let worker_con = con.try_clone()?;
+                handles.push(scope.spawn(move || -> Result<()> {
+                    worker_con.execute_batch(
+                        "SET preserve_insertion_order = false;
+                         SET threads = 1;",
+                    )?;
+                    self.write_data_table_plans_to_duckdb(
+                        worker_idx,
+                        worker_plan,
+                        &worker_con,
+                        materialized_period_data,
+                        &worker_tx,
+                    )
+                }));
+            }
+            drop(tx);
+
+            let mut completed_tables = 0usize;
+            while completed_tables < total_tables {
+                let event = match rx.recv() {
+                    Ok(event) => event,
+                    Err(_) => {
+                        for (worker_idx, handle) in handles.into_iter().enumerate() {
+                            let result = handle
+                                .join()
+                                .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?;
+                            if let Err(err) = result {
+                                return Err(eyre!("Data worker {} failed: {err}", worker_idx + 1));
+                            }
+                        }
+                        return Err(eyre!(
+                            "Worker progress channel closed before all tables completed ({}/{})",
+                            completed_tables,
+                            total_tables
+                        ));
+                    },
+                };
+                match event {
+                    DataWriteWorkerEvent::TableStarted {
+                        worker_id,
+                        index,
+                        total,
+                        table_name,
+                        keys,
+                    } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableStart {
+                                worker_id,
+                                index,
+                                total,
+                                table_name,
+                                keys,
+                            }));
+                        }
+                    },
+                    DataWriteWorkerEvent::TableCompleted {
+                        worker_id,
+                        index,
+                        total,
+                        table_name,
+                        keys,
+                    } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableEnd {
+                                worker_id,
+                                index,
+                                total,
+                            }));
+                        }
+
+                        completed_tables += 1;
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
+                                index: completed_tables,
+                                total: total_tables,
+                                table_name,
+                                keys,
+                            }));
+                            report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
+                        }
+                    },
+                }
+            }
+
+            for (worker_idx, handle) in handles.into_iter().enumerate() {
+                handle
+                    .join()
+                    .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?
+                    .map_err(|err| eyre!("Data worker {} failed: {err}", worker_idx + 1))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn write_data_table_plans_to_duckdb(
+        &self,
+        worker_idx: usize,
+        worker_plan: Vec<DataTableWritePlan>,
+        con: &duckdb::Connection,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
+        worker_tx: &std::sync::mpsc::Sender<DataWriteWorkerEvent>,
+    ) -> Result<()> {
+        let worker_total = worker_plan.len();
+        for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
+            let worker_table_index = worker_table_idx + 1;
+            let table_name = table_plan.table_name.clone();
+            let keys = table_plan.key_ids.len();
+            let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
+                worker_id: worker_idx,
+                index: worker_table_index,
+                total: worker_total,
+                table_name: table_name.clone(),
+                keys,
+            });
+
+            let mut appender = con.appender_to_db(&table_name, "data")?;
+            self.write_data_table_to_appender(
+                &mut appender,
+                &table_plan,
+                materialized_period_data,
+            )?;
+            appender.flush()?;
+            drop(appender);
+
+            let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
+                worker_id: worker_idx,
+                index: worker_table_index,
+                total: worker_total,
+                table_name,
+                keys,
+            });
+        }
+        Ok(())
+    }
+
+    fn write_data_table_to_appender(
+        &self,
+        appender: &mut duckdb::Appender<'_>,
+        plan: &DataTableWritePlan,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
+    ) -> Result<()> {
+        self.write_data_table_batches(plan, materialized_period_data, |record_batch| {
+            appender.append_record_batch(record_batch)?;
+            Ok(())
+        })
+    }
+
+    fn populate_table_data_external_parquet(
+        &self,
+        con: &mut duckdb::Connection,
+        plans: Vec<DataTableWritePlan>,
+        worker_count: usize,
+        external_data_parquet_dir: &std::path::Path,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
+        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
+        let total_tables = plans.len();
+        let worker_plans = Self::distribute_data_table_plans(plans, worker_count);
+        Self::report_duckdb_progress(
+            progress,
+            &format!(
+                "Writing external parquet tables with {} workers",
+                worker_plans.len()
+            ),
+        );
+
+        std::fs::create_dir_all(external_data_parquet_dir)?;
+        let parquet_root = external_data_parquet_dir.canonicalize()?;
+        let worker_dir = parquet_root.join("data");
+        std::fs::create_dir_all(&worker_dir)?;
         let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
         let staged_files = std::thread::scope(|scope| -> Result<Vec<StagedDataFiles>> {
             let mut handles = Vec::with_capacity(worker_plans.len());
             for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
-                let worker_dir = if external_layout {
-                    parquet_root.join("data")
-                } else {
-                    parquet_root.join(format!("data_worker_{worker_idx}"))
-                };
+                let worker_dir = worker_dir.clone();
                 let worker_tx = tx.clone();
 
                 handles.push(scope.spawn(move || -> Result<StagedDataFiles> {
@@ -2484,7 +2626,6 @@ impl SolutionDataset {
                         worker_idx,
                         worker_plan,
                         &worker_dir,
-                        external_layout,
                         materialized_period_data,
                         &worker_tx,
                     )?;
@@ -2561,7 +2702,7 @@ impl SolutionDataset {
             }
 
             let mut staged_files = Vec::with_capacity(handles.len());
-            Self::report_duckdb_progress(progress, "Finalizing staged parquet files");
+            Self::report_duckdb_progress(progress, "Finalizing external parquet files");
             for (worker_idx, handle) in handles.into_iter().enumerate() {
                 let result = handle
                     .join()
@@ -2573,14 +2714,8 @@ impl SolutionDataset {
             Ok(staged_files)
         })?;
 
-        if external_layout {
-            Self::report_duckdb_progress(progress, "Creating external parquet data views");
-            self.create_external_parquet_data_views(con, &parquet_root, &staged_files, progress)?;
-        } else {
-            Self::report_duckdb_progress(progress, "Merging staged parquet files");
-            self.merge_staged_data_files(con, &staged_files, progress)?;
-        }
-        drop(staging_dir);
+        Self::report_duckdb_progress(progress, "Creating external parquet data views");
+        self.create_external_parquet_data_views(con, &parquet_root, &staged_files, progress)?;
         Ok(())
     }
 
@@ -2612,7 +2747,6 @@ impl SolutionDataset {
         worker_idx: usize,
         worker_plan: Vec<DataTableWritePlan>,
         worker_dir: &std::path::Path,
-        external_layout: bool,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         worker_tx: &std::sync::mpsc::Sender<DataWriteWorkerEvent>,
     ) -> Result<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>> {
@@ -2631,14 +2765,10 @@ impl SolutionDataset {
                 keys,
             });
 
-            let parquet_path = if external_layout {
-                let table_dir_name = Self::external_data_table_dir_name(&table_name);
-                let table_dir = worker_dir.join(&table_dir_name);
-                std::fs::create_dir_all(&table_dir)?;
-                table_dir.join(format!("{table_dir_name}.part-00001.parquet"))
-            } else {
-                worker_dir.join(format!("table_{worker_table_index:05}.parquet"))
-            };
+            let table_dir_name = Self::external_data_table_dir_name(&table_name);
+            let table_dir = worker_dir.join(&table_dir_name);
+            std::fs::create_dir_all(&table_dir)?;
+            let parquet_path = table_dir.join(format!("{table_dir_name}.part-00001.parquet"));
             let mut writer = Self::open_data_parquet_writer(&parquet_path)?;
             self.write_data_table_to_parquet(&mut writer, &table_plan, materialized_period_data)?;
             writer.close()?;
@@ -2666,6 +2796,18 @@ impl SolutionDataset {
         plan: &DataTableWritePlan,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
     ) -> Result<()> {
+        self.write_data_table_batches(plan, materialized_period_data, |record_batch| {
+            writer.write(&record_batch)?;
+            Ok(())
+        })
+    }
+
+    fn write_data_table_batches(
+        &self,
+        plan: &DataTableWritePlan,
+        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
+        mut write_batch: impl FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<()> {
         for key_id in plan.key_ids.iter().copied() {
             let ki = self.key_index(key_id)?;
             let key = self.key(key_id)?;
@@ -2689,7 +2831,7 @@ impl SolutionDataset {
                 value_count: ki.length,
                 period_offset: ki.period_offset,
             };
-            self.write_data_range_task_to_parquet(writer, &task, materialized_period_data)?;
+            self.write_data_range_task_batches(&task, materialized_period_data, &mut write_batch)?;
         }
 
         Ok(())
@@ -2706,18 +2848,6 @@ impl SolutionDataset {
             DATA_RECORD_BATCH_SCHEMA.clone(),
             Some(writer_properties),
         )?)
-    }
-
-    fn write_data_range_task_to_parquet(
-        &self,
-        writer: &mut ArrowWriter<std::fs::File>,
-        task: &DataRangeWriteTask,
-        materialized_period_data: Option<&MaterializedPeriodDataFiles>,
-    ) -> Result<()> {
-        self.write_data_range_task_batches(task, materialized_period_data, |record_batch| {
-            writer.write(&record_batch)?;
-            Ok(())
-        })
     }
 
     fn write_data_range_task_batches(
@@ -2849,46 +2979,6 @@ impl SolutionDataset {
             .map_err(|_| eyre!("Chunk size exceeds usize for key_id {}", key_id))
     }
 
-    fn merge_staged_data_files(
-        &self,
-        con: &mut duckdb::Connection,
-        staged_files: &[StagedDataFiles],
-        progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
-    ) -> Result<()> {
-        let target_catalog = Self::current_catalog_name(con)?;
-        let target_catalog_ident = Self::quote_ident(&target_catalog);
-        let files_by_table = Self::staged_files_by_table(staged_files);
-        let total_merges = files_by_table.len();
-
-        for (table_idx, (table_name, files)) in files_by_table.into_iter().enumerate() {
-            let merge_index = table_idx + 1;
-            if let Some(report) = progress.as_mut() {
-                report(DuckdbProgress::Event(ProgressEvent::DataMergeTableStart {
-                    index: merge_index,
-                    total: total_merges,
-                    table_name: table_name.clone(),
-                }));
-            }
-
-            let table_ident = Self::quote_ident(&table_name);
-            let parquet_paths =
-                Self::sql_string_list(files.iter().map(|path| path.to_string_lossy().into_owned()));
-            con.execute_batch(&format!(
-                "INSERT INTO {target_catalog_ident}.data.{table_ident}
-                 SELECT * FROM read_parquet({parquet_paths});"
-            ))?;
-
-            if let Some(report) = progress.as_mut() {
-                report(DuckdbProgress::Event(ProgressEvent::DataMergeTableEnd {
-                    index: merge_index,
-                    total: total_merges,
-                }));
-            }
-        }
-
-        Ok(())
-    }
-
     fn create_external_parquet_data_views(
         &self,
         con: &mut duckdb::Connection,
@@ -2973,14 +3063,6 @@ impl SolutionDataset {
         value.replace('\'', "''")
     }
 
-    fn sql_string_list(values: impl IntoIterator<Item = String>) -> String {
-        let mut sql_values = Vec::new();
-        for value in values {
-            sql_values.push(format!("'{}'", Self::sql_string_literal(&value)));
-        }
-        format!("[{}]", sql_values.join(", "))
-    }
-
     fn external_parquet_path_expr_list(
         parquet_root: &std::path::Path,
         files: &[std::path::PathBuf],
@@ -3041,16 +3123,6 @@ impl SolutionDataset {
 
     fn path_string(path: &std::path::Path) -> String {
         path.to_string_lossy().replace('\\', "/")
-    }
-
-    fn current_catalog_name(con: &duckdb::Connection) -> Result<String> {
-        let mut stmt = con.prepare("SELECT current_catalog();")?;
-        let mut rows = stmt.query([])?;
-        if let Some(row) = rows.next()? {
-            Ok(row.get(0)?)
-        } else {
-            Err(eyre!("Failed to resolve current DuckDB catalog name"))
-        }
     }
 
     /// Name of the DuckDB file inside a staging tempdir. The staging tempdir
@@ -4233,10 +4305,9 @@ impl SolutionDataset {
         Ok(class.name == "System")
     }
 
-    fn key(&self, key_id: i64) -> Result<Key> {
+    fn key(&self, key_id: i64) -> Result<&Key> {
         self.key
             .get(&key_id)
-            .cloned()
             .ok_or_else(|| eyre!("Key with {} not found", key_id))
     }
 
@@ -4492,13 +4563,13 @@ mod tests {
     }
 
     #[test]
-    fn file_period_data_uses_parquet_staging_with_one_thread() -> Result<()> {
+    fn file_period_data_writes_directly_with_one_thread() -> Result<()> {
         let (_output_dir, db_path) = write_file_period_data_database(1)?;
         assert_file_period_data(&db_path)
     }
 
     #[test]
-    fn file_period_data_uses_parquet_staging_with_four_threads() -> Result<()> {
+    fn file_period_data_writes_directly_with_four_threads() -> Result<()> {
         let (_output_dir, db_path) = write_file_period_data_database(4)?;
         assert_file_period_data(&db_path)
     }
@@ -4658,16 +4729,80 @@ mod tests {
     }
 }
 
+fn xml_record_progress_label(tag: &str) -> Option<&'static str> {
+    match tag {
+        "t_attribute_data" => Some("Parsing attribute data"),
+        "t_attribute" => Some("Parsing attributes"),
+        "t_property" => Some("Parsing properties"),
+        "t_band" => Some("Parsing bands"),
+        "t_category" => Some("Parsing categories"),
+        "t_class_group" => Some("Parsing class groups"),
+        "t_class" => Some("Parsing classes"),
+        "t_collection" => Some("Parsing collections"),
+        "t_config" => Some("Parsing config"),
+        "t_key_index" => Some("Parsing key indexes"),
+        "t_key" => Some("Parsing keys"),
+        "t_membership" => Some("Parsing memberships"),
+        "t_model" => Some("Parsing models"),
+        "t_object" => Some("Parsing objects"),
+        "t_period_0" => Some("Parsing period intervals"),
+        "t_period_1" => Some("Parsing period days"),
+        "t_period_2" => Some("Parsing period weeks"),
+        "t_period_3" => Some("Parsing period months"),
+        "t_period_4" => Some("Parsing period years"),
+        "t_period_6" => Some("Parsing period hours"),
+        "t_period_7" => Some("Parsing period quarters"),
+        "t_phase_1" => Some("Parsing phase LT"),
+        "t_phase_2" => Some("Parsing phase PASA"),
+        "t_phase_3" => Some("Parsing phase MT"),
+        "t_phase_4" => Some("Parsing phase ST"),
+        "t_sample" => Some("Parsing samples"),
+        "t_sample_weight" => Some("Parsing sample weights"),
+        "t_timeslice" => Some("Parsing timeslices"),
+        "t_unit" => Some("Parsing units"),
+        "t_memo_object" => Some("Parsing memo objects"),
+        "t_custom_column" => Some("Parsing custom columns"),
+        _ => None,
+    }
+}
+
+fn sort_index_map_if_needed<K: Ord, V>(map: &mut indexmap::IndexMap<K, V>) {
+    if !map.keys().is_sorted() {
+        map.sort_keys();
+    }
+}
+
+fn parse_element_text<T: std::str::FromStr>(node: &Node) -> Result<T>
+where
+    T::Err: std::fmt::Debug,
+{
+    let tag_name = node.tag_name();
+    let tag_name = tag_name.name();
+    let value = node
+        .text()
+        .ok_or_else(|| eyre!("Missing text for {} element: {:?}", tag_name, node))?;
+
+    value
+        .parse::<T>()
+        .map_err(|_| eyre!("Invalid value for {}: {:?}", tag_name, node))
+}
+
+fn required_xml_field<T>(value: Option<T>, tag_name: &str, node: &Node) -> Result<T> {
+    value.ok_or_else(|| eyre!("Missing {} element: {:?}", tag_name, node))
+}
+
 /// Helper function to get text from a child element, returns any type T that implements FromStr
 fn get_child<T: std::str::FromStr>(node: &Node, tag_name: &str) -> Result<T>
 where
     T::Err: std::fmt::Debug,
 {
-    node.children()
+    let value = node
+        .children()
         .find(|n| n.has_tag_name(tag_name))
         .and_then(|n| n.text())
-        .map(|s| s.to_string())
-        .ok_or_else(|| eyre!("Missing {} element: {:?}", tag_name, node))?
+        .ok_or_else(|| eyre!("Missing {} element: {:?}", tag_name, node))?;
+
+    value
         .parse::<T>()
         .map_err(|_| eyre!("Invalid value for {}: {:?}", tag_name, node))
 }
