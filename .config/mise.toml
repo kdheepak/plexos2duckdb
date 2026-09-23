@@ -24,6 +24,15 @@ if [ ! -d tests/data/plexos-solution-files ]; then
 fi
 '''
 
+[tasks."plexos2duckdb:check"]
+description = "Check the Rust crate and update the Python lockfile"
+dir = "{{ config_root }}"
+run = '''
+set -e
+cargo check
+uv lock --directory python
+'''
+
 [tasks."plexos2duckdb:test"]
 description = "Run the Rust test suite after step 0 toolchain setup"
 depends = ["plexos2duckdb:download-test-data"]
