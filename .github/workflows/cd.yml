@@ -24,15 +24,15 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.REF }}
 
       - name: Checkout test data
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: kdheepak/plexos-solution-files
           path: tests/data/plexos-solution-files
@@ -56,9 +56,9 @@ jobs:
   create-release:
     name: Create Release
     needs: [test]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.REF }}
 
@@ -72,7 +72,7 @@ jobs:
   publish-python:
     name: Publish Python package
     needs: [upload-python-distributions, upload-binaries]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       id-token: write
     environment:
@@ -80,7 +80,7 @@ jobs:
       url: https://pypi.org/p/plexos2duckdb
     steps:
       - name: Download Python distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: python-dist-*
           path: dist
@@ -97,7 +97,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64-manylinux_2_28
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             python-architecture: x64
             manylinux: "2_28"
@@ -134,7 +134,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.REF }}
 
@@ -145,7 +145,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           architecture: ${{ matrix.python-architecture }}
@@ -222,7 +222,7 @@ jobs:
             python/dist/*
 
       - name: Upload Python distributions as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-dist-${{ matrix.name }}
           path: python/dist/*
@@ -236,7 +236,7 @@ jobs:
       matrix:
         include:
           - name: linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive_suffix: linux-x86_64
 
@@ -253,7 +253,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.REF }}
 
