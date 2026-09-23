@@ -81,7 +81,7 @@ wheels = [
 
 [[package]]
 name = "plexos2duckdb"
-version = "0.1.0b14"
+version = "0.1.0b13"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
