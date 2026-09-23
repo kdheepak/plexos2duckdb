@@ -196,7 +196,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           rust-toolchain: stable
-          sccache: true
+          sccache: ${{ runner.os == 'Linux' }}
           before-script-linux: |
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
           args: >-
