@@ -191,6 +191,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           rust-toolchain: stable
+          sccache: true
           args: >-
             --release --locked --compatibility pypi --out dist ${{ matrix.sdist && '--sdist' || ''
             }}
