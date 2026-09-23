@@ -11,7 +11,6 @@ use ctrlc;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
 use serde::Serialize;
-use tabled::{Table, Tabled, settings::Style};
 
 #[derive(Parser)]
 #[command(author, version = plexos2duckdb::utils::version(), about, long_about = None)]
@@ -93,13 +92,7 @@ struct DatabaseMetadata {
     model_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Tabled)]
-struct MetadataRow {
-    field: String,
-    value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Tabled, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct TableInventoryRow {
     schema: String,
     table: String,
@@ -330,6 +323,32 @@ fn load_table_inventory(con: &duckdb::Connection) -> Result<Vec<TableInventoryRo
     Ok(inventory)
 }
 
+fn print_table<const N: usize>(headers: [&str; N], rows: &[[&str; N]]) {
+    let mut widths = headers.map(console::measure_text_width);
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(console::measure_text_width(cell));
+        }
+    }
+
+    for row in std::iter::once(&headers).chain(rows) {
+        for (column, cell) in row.iter().enumerate() {
+            if column > 0 {
+                print!("  ");
+            }
+            if column + 1 == N {
+                print!("{cell}");
+            } else {
+                print!(
+                    "{}",
+                    console::pad_str(cell, widths[column], console::Alignment::Left, None)
+                );
+            }
+        }
+        println!();
+    }
+}
+
 fn inspect_database(args: InspectArgs) -> Result<()> {
     if !args.input.exists() {
         return Err(eyre!(
@@ -349,30 +368,30 @@ fn inspect_database(args: InspectArgs) -> Result<()> {
         });
     }
 
-    let metadata_rows = vec![
-        MetadataRow {
-            field: "database".to_string(),
-            value: metadata.database,
-        },
-        MetadataRow {
-            field: "converter version".to_string(),
-            value: metadata.converter_version,
-        },
-        MetadataRow {
-            field: "source file".to_string(),
-            value: metadata.source_file,
-        },
-        MetadataRow {
-            field: "model name".to_string(),
-            value: metadata.model_name,
-        },
-    ];
-
     println!("Metadata");
-    println!("{}", Table::new(metadata_rows).with(Style::rounded()));
+    print_table(
+        ["field", "value"],
+        &[
+            ["database", &metadata.database],
+            ["converter version", &metadata.converter_version],
+            ["source file", &metadata.source_file],
+            ["model name", &metadata.model_name],
+        ],
+    );
     println!();
     println!("Inventory");
-    println!("{}", Table::new(inventory).with(Style::rounded()));
+    let inventory_rows = inventory
+        .iter()
+        .map(|row| {
+            [
+                row.schema.as_str(),
+                row.table.as_str(),
+                row.kind.as_str(),
+                row.row_count.as_str(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(["schema", "table", "kind", "row_count"], &inventory_rows);
     Ok(())
 }
 
