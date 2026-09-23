@@ -357,6 +357,49 @@ fn assert_report_view_shape(con: &Connection, view_name: &str, _metric_name: &st
 }
 
 #[test]
+fn print_summary_parses_fixture_without_creating_database() {
+    let fixture_dir = fixture_dir();
+    let temp_dir = temp_dir();
+    let fixture_name = "Model_Base_Solution.zip";
+    let source_path = fixture_dir.join(fixture_name);
+    let output_path = generated_output_path(&temp_dir, fixture_name);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_plexos2duckdb"))
+        .args([
+            "convert",
+            "--input",
+            source_path.to_str().expect("fixture path utf8"),
+            "--output",
+            output_path.to_str().expect("output path utf8"),
+            "--print-summary",
+            "--no-progress-bar",
+        ])
+        .output()
+        .expect("run plexos2duckdb summary");
+
+    assert!(
+        output.status.success(),
+        "summary failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output_path.exists(), "summary must not create a database");
+
+    let stdout = String::from_utf8(output.stdout).expect("summary output utf8");
+    for expected in [
+        "Summary of PLEXOS solution dataset:",
+        "  models:",
+        "  keys:",
+        "  key indices:",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing summary line: {expected}"
+        );
+    }
+}
+
+#[test]
 fn all_solution_zip_fixtures_convert_end_to_end() {
     let fixture_dir = fixture_dir();
     let temp_dir = temp_dir();
