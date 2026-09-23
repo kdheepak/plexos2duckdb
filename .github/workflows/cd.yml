@@ -156,6 +156,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Stage README for source distribution
+        if: matrix.sdist
+        shell: bash
+        run: |
+          cp README.md python/README.md
+          sed -i 's#readme = "../README.md"#readme = "README.md"#' python/pyproject.toml
+          grep -q '^readme = "README.md"$' python/pyproject.toml
+
       - name: Build Python distributions
         uses: PyO3/maturin-action@v1
         env:
