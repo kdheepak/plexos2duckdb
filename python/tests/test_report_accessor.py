@@ -1,7 +1,8 @@
 """Tests for the ``PLEXOS2DuckDB.report`` dot-accessor.
 
-These tests use the pre-built ``Model_Base_LT_Solution.duckdb`` fixture
-under ``tests/data`` so they do not depend on running the Rust converter.
+These tests convert a PLEXOS fixture with the Rust CLI, then read the new
+database with Python. This also checks storage-format compatibility.
+Download the Rust test fixtures and put the built CLI on PATH before running.
 """
 
 from __future__ import annotations
@@ -15,19 +16,27 @@ import plexos2duckdb
 from plexos2duckdb import api as api_module
 
 
-FIXTURE_DB = (
+FIXTURE_ZIP = (
     pathlib.Path(__file__).resolve().parents[2]
     / "tests"
     / "data"
-    / "Model_Base_LT_Solution.duckdb"
+    / "plexos-solution-files"
+    / "Model_Base_LT_Solution.zip"
 )
 
 
+@pytest.fixture(scope="module")
+def converted_database(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
+    if not FIXTURE_ZIP.exists():
+        pytest.skip(f"missing fixture: {FIXTURE_ZIP}")
+    output_path = tmp_path_factory.mktemp("report") / "Model_Base_LT_Solution.duckdb"
+    converter = plexos2duckdb.PLEXOS2DuckDB(FIXTURE_ZIP, output_path=output_path)
+    return converter.convert()
+
+
 @pytest.fixture
-def client() -> plexos2duckdb.PLEXOS2DuckDB:
-    if not FIXTURE_DB.exists():
-        pytest.skip(f"missing fixture: {FIXTURE_DB}")
-    return plexos2duckdb.PLEXOS2DuckDB(output_path=FIXTURE_DB)
+def client(converted_database: pathlib.Path) -> plexos2duckdb.PLEXOS2DuckDB:
+    return plexos2duckdb.PLEXOS2DuckDB(output_path=converted_database)
 
 
 @pytest.fixture
