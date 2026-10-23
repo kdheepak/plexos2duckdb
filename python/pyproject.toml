@@ -28,7 +28,7 @@ classifiers = [
   "Topic :: Utilities",
 ]
 keywords = ["plexos", "duckdb", "cli", "energy"]
-dependencies = ["duckdb>=1.4.0", "rich>=13.0.0"]
+dependencies = ["duckdb>=2.0.0,<3", "rich>=13.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/epri-dev/plexos2duckdb"
