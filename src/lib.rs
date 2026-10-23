@@ -906,7 +906,7 @@ impl SolutionDataset {
 
         for i in 0..archive.len() {
             let file = archive.by_index(i)?;
-            let file_name = file.name().to_string();
+            let file_name = file.name()?.into_owned();
             let file_name_lower = file_name.to_lowercase();
             if file_name_lower.ends_with(".xml") {
                 if let Some(stem) = std::path::Path::new(&file_name)
@@ -944,7 +944,7 @@ impl SolutionDataset {
             eprintln!(
                 "Warning: Expected XML file named '{}.xml', using first XML file '{}' instead.",
                 zip_stem,
-                archive.by_index(idx)?.name()
+                archive.by_index(idx)?.name()?
             );
             idx
         } else {
@@ -962,7 +962,7 @@ impl SolutionDataset {
         let archive_len = archive.len();
         for i in 0..archive_len {
             let file = archive.by_index(i)?;
-            let name = file.name().to_string();
+            let name = file.name()?.into_owned();
 
             if let Some(digit) = Self::is_valid_bin_filename(&name) {
                 if file.compression() == zip::CompressionMethod::Stored {
@@ -4572,6 +4572,34 @@ mod tests {
     fn file_period_data_writes_directly_with_four_threads() -> Result<()> {
         let (_output_dir, db_path) = write_file_period_data_database(4)?;
         assert_file_period_data(&db_path)
+    }
+
+    #[test]
+    fn read_zip_archive_falls_back_to_unicode_xml_name() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let zip_path = temp_dir.path().join("solution.zip");
+        let zip_file = std::fs::File::create(&zip_path)?;
+        let mut zip_writer = zip::ZipWriter::new(zip_file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        zip_writer.start_file("Model Café Solution.xml", options)?;
+        zip_writer.write_all(b"<root />")?;
+        zip_writer.start_file("t_data_0.BIN", options)?;
+        let expected = 12.5_f64.to_le_bytes();
+        zip_writer.write_all(&expected)?;
+        zip_writer.finish()?;
+
+        let (xml_content, period_data) =
+            SolutionDataset::read_zip_archive(&zip_path, "absent", &mut None)?;
+        assert_eq!(xml_content, "<root />");
+        let data = period_data
+            .get(&0)
+            .ok_or_else(|| eyre!("expected period data for digit 0"))?;
+        let mut actual = [0u8; 8];
+        data.read_exact_at(0, &mut actual)?;
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[test]
