@@ -2,11 +2,12 @@
 
 These tests convert a PLEXOS fixture with the Rust CLI, then read the new
 database with Python. This also checks storage-format compatibility.
-Download the Rust test fixtures and put the built CLI on PATH before running.
+Run ``mise run plexos2duckdb:test`` to download fixtures and select the built CLI.
 """
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 import duckdb
@@ -30,13 +31,20 @@ def converted_database(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path
     if not FIXTURE_ZIP.exists():
         pytest.skip(f"missing fixture: {FIXTURE_ZIP}")
     output_path = tmp_path_factory.mktemp("report") / "Model_Base_LT_Solution.duckdb"
-    converter = plexos2duckdb.PLEXOS2DuckDB(FIXTURE_ZIP, output_path=output_path)
+    converter = plexos2duckdb.PLEXOS2DuckDB(
+        FIXTURE_ZIP,
+        output_path=output_path,
+        executable=os.environ.get("PLEXOS2DUCKDB_TEST_EXECUTABLE"),
+    )
     return converter.convert()
 
 
 @pytest.fixture
 def client(converted_database: pathlib.Path) -> plexos2duckdb.PLEXOS2DuckDB:
-    return plexos2duckdb.PLEXOS2DuckDB(output_path=converted_database)
+    return plexos2duckdb.PLEXOS2DuckDB(
+        output_path=converted_database,
+        executable=os.environ.get("PLEXOS2DUCKDB_TEST_EXECUTABLE"),
+    )
 
 
 @pytest.fixture

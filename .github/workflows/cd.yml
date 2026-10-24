@@ -53,13 +53,6 @@ jobs:
       - name: Run test suite
         run: mise run plexos2duckdb:test
 
-      - name: Test Python access to converted databases
-        run: |
-          uv sync --directory python --locked --no-install-project
-          PATH="$GITHUB_WORKSPACE/target/debug:$PATH" \
-            PYTHONPATH="$GITHUB_WORKSPACE/python" \
-            uv run --directory python --locked --no-sync python -m pytest
-
   create-release:
     name: Create Release
     needs: [test]

@@ -14,6 +14,7 @@ typst = "latest"
 
 [tasks."plexos2duckdb:download-test-data"]
 description = "Download the PLEXOS fixture repository used by tests"
+dir = "{{ config_root }}"
 run = '''
 if [ ! -d tests/data/plexos-solution-files ]; then
   if ! command -v git >/dev/null 2>&1; then
@@ -34,9 +35,10 @@ uv lock --directory python
 '''
 
 [tasks."plexos2duckdb:test"]
-description = "Run the Rust test suite after step 0 toolchain setup"
+description = "Run the Rust and Python test suites against the current CLI"
 depends = ["plexos2duckdb:download-test-data"]
-run = "cargo test"
+dir = "{{ config_root }}"
+run = "uv run --script .config/mise/run-tests.py"
 
 [tasks."plexos2duckdb:repl"]
 description = "Start an IPython REPL with the package installed editable"
