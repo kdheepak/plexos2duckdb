@@ -1,7 +1,7 @@
 [settings]
 env_shell_expand = true
 status.show_env = true
-# Keep Linux CI download URLs when updating the lockfile on macOS.
+lockfile_mode = "generate"
 lockfile_platforms = [
   "linux-arm64",
   "linux-arm64-musl",
