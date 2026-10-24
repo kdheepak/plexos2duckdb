@@ -1,0 +1,134 @@
+#!/usr/bin/env -S uv run --script
+# [MISE] dir="{{config_root}}"
+# [MISE] description="Set the Rust and Python package versions and refresh both lockfiles"
+# [USAGE] arg "<version>" help="Release version, e.g. 0.1.0-beta.14 or 1.0.0"
+# [USAGE] flag "--dry-run" help="Show the versions without changing files"
+# /// script
+# requires-python = ">=3.12"
+# ///
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import tomllib
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[4]
+VERSION_FILES = ("Cargo.toml", "Cargo.lock", "python/pyproject.toml", "python/uv.lock")
+NUMBER = r"(?:0|[1-9][0-9]*)"
+VERSION_PATTERN = re.compile(
+    rf"v?({NUMBER}\.{NUMBER}\.{NUMBER})(?:-(alpha|beta|rc)\.({NUMBER}))?"
+)
+
+
+def release_versions(value: str) -> tuple[str, str]:
+    match = VERSION_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            "Use MAJOR.MINOR.PATCH, optionally followed by -alpha.N, -beta.N, or -rc.N."
+        )
+    base, prerelease, number = match.groups()
+    if prerelease is None:
+        return base, base
+    suffix = {"alpha": "a", "beta": "b", "rc": "rc"}[prerelease]
+    return f"{base}-{prerelease}.{number}", f"{base}{suffix}{number}"
+
+
+def replace_version(content: bytes, table: str, version: str) -> bytes:
+    text = content.decode("utf-8")
+    expected = tomllib.loads(text)
+    if expected[table]["name"] != "plexos2duckdb":
+        raise ValueError(f"Expected plexos2duckdb in [{table}]")
+    expected[table]["version"] = version
+    header = re.search(
+        rf"(?m)^[ \t]*\[{re.escape(table)}\][ \t]*(?:#[^\r\n]*)?\r?$", text
+    )
+    if header is None:
+        raise ValueError(f"Missing [{table}] header")
+    start = header.end()
+    next_table = re.search(r"(?m)^[ \t]*\[", text[start:])
+    end = start + next_table.start() if next_table else len(text)
+    body, count = re.subn(
+        r"""(?m)^([ \t]*version[ \t]*=[ \t]*)(["'])(.*?)\2""",
+        lambda match: f"{match[1]}{match[2]}{version}{match[2]}",
+        text[start:end],
+    )
+    updated = text[:start] + body + text[end:]
+    if count != 1 or tomllib.loads(updated) != expected:
+        raise ValueError(f"Expected one version field in [{table}]")
+    return updated.encode("utf-8")
+
+
+def check_lock_version(path: pathlib.Path, version: str, original: bytes) -> None:
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    versions = [
+        package["version"]
+        for package in data["package"]
+        if package["name"] == "plexos2duckdb"
+    ]
+    if versions != [version]:
+        raise ValueError(f"{path.name}: expected package version {version}, got {versions}")
+    before = tomllib.loads(original.decode("utf-8"))
+
+    def dependencies(lock):
+        return sorted(
+            json.dumps(package, sort_keys=True)
+            for package in lock["package"]
+            if package["name"] != "plexos2duckdb"
+        )
+
+    if dependencies(data) != dependencies(before):
+        raise ValueError(f"{path.name}: dependency changes detected; update dependencies first")
+
+
+def set_version(root: pathlib.Path, value: str, *, dry_run: bool = False) -> None:
+    rust_version, python_version = release_versions(value)
+    originals = {name: (root / name).read_bytes() for name in VERSION_FILES}
+    updates = {
+        "Cargo.toml": replace_version(originals["Cargo.toml"], "package", rust_version),
+        "python/pyproject.toml": replace_version(
+            originals["python/pyproject.toml"], "project", python_version
+        ),
+    }
+    print(f"Rust: {rust_version}; Python: {python_version}", flush=True)
+    if dry_run:
+        print("Dry run: no files changed.")
+        return
+
+    try:
+        for name, content in updates.items():
+            (root / name).write_bytes(content)
+        # Keep dependency versions locked; only the workspace package changes.
+        for command in (
+            ["cargo", "update", "--workspace"],
+            ["uv", "lock", "--directory", "python"],
+        ):
+            print("+ " + " ".join(command), flush=True)
+            subprocess.run(command, cwd=root, check=True)
+        check_lock_version(root / "Cargo.lock", rust_version, originals["Cargo.lock"])
+        check_lock_version(root / "python/uv.lock", python_version, originals["python/uv.lock"])
+    except (Exception, KeyboardInterrupt):
+        for name, content in originals.items():
+            (root / name).write_bytes(content)
+        raise
+    print("Updated both manifests and lockfiles.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Set the package release version.")
+    parser.add_argument("version", help="Rust release version; a leading v is also accepted")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    try:
+        set_version(ROOT, args.version, dry_run=args.dry_run)
+    except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
