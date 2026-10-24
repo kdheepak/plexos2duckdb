@@ -1,5 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        // libduckdb-sys 1.20000.0 can put the registrar after DuckDB's archive.
+        // GNU ld does not rescan earlier archives. Request this symbol up front;
+        // the existing static constructor still performs extension registration.
+        println!("cargo:rustc-link-arg=-Wl,--undefined=duckdb_register_static_extensions");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-link-lib=Rstrtmgr");
     }
