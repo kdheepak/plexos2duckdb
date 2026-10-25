@@ -935,19 +935,26 @@ struct DataTableWritePlan {
 }
 
 struct DataWriteQueue {
-    plans: std::sync::Mutex<std::vec::IntoIter<DataTableWritePlan>>,
+    plans: std::sync::Mutex<std::vec::IntoIter<(usize, DataTableWritePlan)>>,
     cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl DataWriteQueue {
     fn new(plans: Vec<DataTableWritePlan>) -> Self {
+        let mut part_counts = std::collections::HashMap::<String, usize>::new();
+        let mut numbered_plans = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let part = part_counts.entry(plan.table_name.clone()).or_default();
+            *part += 1;
+            numbered_plans.push((*part, plan));
+        }
         Self {
-            plans: std::sync::Mutex::new(plans.into_iter()),
+            plans: std::sync::Mutex::new(numbered_plans.into_iter()),
             cancelled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn next(&self) -> Result<Option<DataTableWritePlan>> {
+    fn next(&self) -> Result<Option<(usize, DataTableWritePlan)>> {
         let mut plans = self
             .plans
             .lock()
@@ -2653,11 +2660,10 @@ impl SolutionDataset {
         )?;
 
         if let Some(external_data_parquet_dir) = external_data_parquet_dir.as_deref() {
-            let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
             self.populate_table_data_external_parquet(
                 con,
                 plans,
-                worker_count,
+                data_write_threads,
                 external_data_parquet_dir,
                 materialized_period_data.as_ref(),
                 progress,
@@ -3046,7 +3052,7 @@ impl SolutionDataset {
         worker_tx: &std::sync::mpsc::Sender<DataWriteWorkerEvent>,
     ) -> Result<()> {
         let mut completed = 0;
-        while let Some(table_plan) = queue.next()? {
+        while let Some((_, table_plan)) = queue.next()? {
             let worker_table_index = completed + 1;
             let table_name = table_plan.table_name.clone();
             let keys = table_plan.index_ids.len();
@@ -3123,26 +3129,34 @@ impl SolutionDataset {
         &self,
         con: &mut duckdb::Connection,
         plans: Vec<DataTableWritePlan>,
-        worker_count: usize,
+        configured_threads: Option<usize>,
         external_data_parquet_dir: &std::path::Path,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
         let total_tables = plans.len();
+        let total_tasks = plans.iter().map(|plan| plan.index_ids.len().max(1)).sum();
+        let worker_count = Self::resolve_data_write_threads(total_tasks, configured_threads);
+        let plans = self.partition_data_table_plans(plans, worker_count)?;
+        let worker_count = worker_count.min(plans.len());
         let total_rows = Self::planned_data_rows(&plans)?;
-        let worker_plans = Self::distribute_data_table_plans(plans, worker_count);
+        let mut table_progress = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        for plan in &plans {
+            let (remaining_parts, _) = table_progress.entry(plan.table_name.clone()).or_default();
+            *remaining_parts += 1;
+        }
         Self::report_duckdb_progress(
             progress,
             &format!(
-                "Writing external parquet tables with {} workers",
-                worker_plans.len()
+                "Writing external parquet tables with {worker_count} workers ({} partitions)",
+                plans.len()
             ),
         );
         if let Some(report) = progress.as_mut() {
             report(DuckdbProgress::Event(ProgressEvent::DataWriteStart {
                 rows: total_rows,
-                partitions: total_tables,
-                workers: worker_plans.len(),
+                partitions: plans.len(),
+                workers: worker_count,
             }));
         }
 
@@ -3150,23 +3164,26 @@ impl SolutionDataset {
         let parquet_root = external_data_parquet_dir.canonicalize()?;
         let worker_dir = parquet_root.join("data");
         std::fs::create_dir_all(&worker_dir)?;
+        let queue = DataWriteQueue::new(plans);
         let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
         let staged_files = std::thread::scope(|scope| -> Result<Vec<StagedDataFiles>> {
-            let mut handles = Vec::with_capacity(worker_plans.len());
-            for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
-                let worker_dir = worker_dir.clone();
+            let mut handles = Vec::with_capacity(worker_count);
+            for worker_idx in 0..worker_count {
+                let worker_dir = &worker_dir;
                 let worker_tx = tx.clone();
-
+                let queue = &queue;
                 handles.push(scope.spawn(move || -> Result<StagedDataFiles> {
-                    std::fs::create_dir_all(&worker_dir)?;
-                    let table_files = self.write_data_table_plans_to_parquet_files(
+                    let result = self.write_data_table_plans_to_parquet_files(
                         worker_idx,
-                        worker_plan,
-                        &worker_dir,
+                        queue,
+                        worker_dir,
                         materialized_period_data,
                         &worker_tx,
-                    )?;
-                    Ok(StagedDataFiles::new(table_files))
+                    );
+                    if result.is_err() {
+                        queue.cancel();
+                    }
+                    result.map(StagedDataFiles::new)
                 }));
             }
             drop(tx);
@@ -3221,6 +3238,17 @@ impl SolutionDataset {
                             }));
                         }
 
+                        let (remaining_parts, completed_keys) = table_progress
+                            .get_mut(&table_name)
+                            .ok_or_else(|| eyre!("Unexpected completed table: {table_name}"))?;
+                        *remaining_parts = remaining_parts.checked_sub(1).ok_or_else(|| {
+                            eyre!("Too many completed partitions for table: {table_name}")
+                        })?;
+                        *completed_keys += keys;
+                        if *remaining_parts != 0 {
+                            continue;
+                        }
+                        let keys = *completed_keys;
                         completed_tables += 1;
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
@@ -3246,16 +3274,18 @@ impl SolutionDataset {
                 }
             }
 
-            let mut staged_files = Vec::with_capacity(handles.len());
             Self::report_duckdb_progress(progress, "Finalizing external parquet files");
-            for (worker_idx, handle) in handles.into_iter().enumerate() {
-                let result = handle
-                    .join()
-                    .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?;
-                staged_files.push(
-                    result.map_err(|err| eyre!("Data worker {} failed: {err}", worker_idx + 1))?,
-                );
-            }
+            let results = handles
+                .into_iter()
+                .enumerate()
+                .map(|(worker_idx, handle)| {
+                    handle
+                        .join()
+                        .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?
+                        .map_err(|err| eyre!("Data worker {} failed: {err}", worker_idx + 1))
+                })
+                .collect::<Vec<_>>();
+            let staged_files = results.into_iter().collect::<Result<Vec<_>>>()?;
             if completed_tables != total_tables {
                 return Err(eyre!(
                     "Data workers stopped before all tables completed ({completed_tables}/{total_tables})"
@@ -3269,57 +3299,37 @@ impl SolutionDataset {
         Ok(())
     }
 
-    fn distribute_data_table_plans(
-        plans: Vec<DataTableWritePlan>,
-        worker_count: usize,
-    ) -> Vec<Vec<DataTableWritePlan>> {
-        let mut worker_plans = vec![Vec::<DataTableWritePlan>::new(); worker_count];
-        let mut worker_loads = vec![0u128; worker_count];
-
-        for plan in plans {
-            let (worker_idx, _) = worker_loads
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, load)| **load)
-                .expect("worker_count must be non-zero");
-
-            worker_loads[worker_idx] =
-                worker_loads[worker_idx].saturating_add(plan.estimated_values);
-            worker_plans[worker_idx].push(plan);
-        }
-
-        worker_plans.retain(|p| !p.is_empty());
-        worker_plans
-    }
-
     fn write_data_table_plans_to_parquet_files(
         &self,
         worker_idx: usize,
-        worker_plan: Vec<DataTableWritePlan>,
+        queue: &DataWriteQueue,
         worker_dir: &std::path::Path,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         worker_tx: &std::sync::mpsc::Sender<DataWriteWorkerEvent>,
     ) -> Result<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>> {
-        let worker_total = worker_plan.len();
+        let mut completed = 0;
         let mut table_files = std::collections::BTreeMap::<String, Vec<std::path::PathBuf>>::new();
 
-        for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
-            let worker_table_index = worker_table_idx + 1;
+        while let Some((part_id, table_plan)) = queue.next()? {
+            let worker_table_index = completed + 1;
             let table_name = table_plan.table_name.clone();
             let keys = table_plan.index_ids.len();
             let rows = u64::try_from(table_plan.estimated_values)?;
-            let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
-                worker_id: worker_idx,
-                index: worker_table_index,
-                table_name: table_name.clone(),
-                keys,
-                rows,
-            });
+            worker_tx
+                .send(DataWriteWorkerEvent::TableStarted {
+                    worker_id: worker_idx,
+                    index: worker_table_index,
+                    table_name: table_name.clone(),
+                    keys,
+                    rows,
+                })
+                .map_err(|_| eyre!("Data write progress receiver stopped"))?;
 
             let table_dir_name = Self::external_data_table_dir_name(&table_name);
             let table_dir = worker_dir.join(&table_dir_name);
             std::fs::create_dir_all(&table_dir)?;
-            let parquet_path = table_dir.join(format!("{table_dir_name}.part-00001.parquet"));
+            let parquet_path =
+                table_dir.join(format!("{table_dir_name}.part-{part_id:05}.parquet"));
             let mut writer = Self::open_data_parquet_writer(&parquet_path)?;
             self.write_data_table_to_parquet(
                 &mut writer,
@@ -3342,18 +3352,23 @@ impl SolutionDataset {
                 .or_default()
                 .push(parquet_path);
 
-            let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
-                worker_id: worker_idx,
-                index: worker_table_index,
-                table_name,
-                keys,
-                rows,
-            });
+            completed = worker_table_index;
+            worker_tx
+                .send(DataWriteWorkerEvent::TableCompleted {
+                    worker_id: worker_idx,
+                    index: worker_table_index,
+                    table_name,
+                    keys,
+                    rows,
+                })
+                .map_err(|_| eyre!("Data write progress receiver stopped"))?;
         }
-        let _ = worker_tx.send(DataWriteWorkerEvent::Finished {
-            worker_id: worker_idx,
-            completed: worker_total,
-        });
+        worker_tx
+            .send(DataWriteWorkerEvent::Finished {
+                worker_id: worker_idx,
+                completed,
+            })
+            .map_err(|_| eyre!("Data write progress receiver stopped"))?;
 
         Ok(table_files)
     }
