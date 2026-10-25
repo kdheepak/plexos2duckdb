@@ -632,6 +632,7 @@ struct MemoObject {
 struct ZipXmlSource {
     archive: zip::ZipArchive<std::fs::File>,
     index: usize,
+    plexos_param_index: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -867,6 +868,7 @@ pub struct SolutionDataset {
     period_data: indexmap::IndexMap<i64, PeriodData>,
     simulation_log: Option<String>,
     run_stats: Option<String>,
+    plexos_param_xml: Option<String>,
     // calculated fields
     timestamp_block: std::collections::HashMap<String, Vec<(chrono::DateTime<chrono::Utc>, i64)>>,
     table_key_index_mapping: std::collections::HashMap<String, Vec<usize>>,
@@ -1157,6 +1159,7 @@ impl SolutionDataset {
         let mut model_name_xml_index = None;
         let mut first_xml_index = None;
         let mut xml_indices = Vec::new();
+        let mut plexos_param_index = None;
 
         let model_name = if !model_name.is_empty() {
             Some(model_name.to_lowercase())
@@ -1177,15 +1180,22 @@ impl SolutionDataset {
             let file = archive.by_index(i)?;
             let file_name = file.name()?.into_owned();
             let file_name_lower = file_name.to_lowercase();
+            if file_name_lower.rsplit('/').next() == Some("plexos_param.xml") {
+                if plexos_param_index.replace(i).is_some() {
+                    return Err(eyre!(
+                        "Multiple PLEXOS_Param.xml files found in the ZIP archive"
+                    ));
+                }
+                continue;
+            }
             if file_name_lower.ends_with(".xml") {
                 xml_indices.push(i);
                 if let Some(stem) = std::path::Path::new(&file_name)
                     .file_stem()
                     .map(|s| s.to_string_lossy())
                 {
-                    if stem == zip_stem {
+                    if stem == zip_stem && preferred_xml_index.is_none() {
                         preferred_xml_index = Some(i);
-                        break;
                     }
                     if model_name
                         .as_ref()
@@ -1280,6 +1290,7 @@ impl SolutionDataset {
             ZipXmlSource {
                 archive,
                 index: xml_index_to_use,
+                plexos_param_index,
             },
             period_data,
         ))
@@ -1293,12 +1304,22 @@ impl SolutionDataset {
         let path = path.as_ref();
         let (mut source, period_data) =
             Self::read_zip_archive(path, &self.model_name, &mut report)?;
+        let plexos_param_xml = if let Some(index) = source.plexos_param_index {
+            Self::report_progress(&mut report, "Reading PLEXOS_Param.xml from ZIP archive");
+            Some(
+                std::io::read_to_string(source.archive.by_index(index)?)
+                    .map_err(|error| eyre!("Failed to read PLEXOS_Param.xml: {error}"))?,
+            )
+        } else {
+            None
+        };
         Self::report_progress(&mut report, "Reading XML from ZIP archive");
         let file = source.archive.by_index(source.index)?;
         let mut dataset = self
             .with_file(path)
             .with_xml_reader_impl(std::io::BufReader::new(file), report)?;
         dataset.period_data = period_data;
+        dataset.plexos_param_xml = plexos_param_xml;
         Ok(dataset)
     }
 
@@ -2257,6 +2278,16 @@ impl SolutionDataset {
             &mut step_index,
             total_steps,
             label,
+            |progress| self.populate_table_plexos_parameters(&mut con, progress),
+        )?;
+
+        let label = next_progress_step();
+        Self::report_duckdb_progress(&mut progress, label);
+        Self::with_duckdb_step(
+            &mut progress,
+            &mut step_index,
+            total_steps,
+            label,
             |progress| self.populate_table_memberships(&mut con, progress),
         )?;
 
@@ -2508,6 +2539,7 @@ impl SolutionDataset {
             "Creating raw schema",
             "Writing metadata",
             "Writing config",
+            "Writing PLEXOS parameters",
             "Writing memberships",
             "Writing collections",
             "Writing classes",
@@ -3659,6 +3691,49 @@ impl SolutionDataset {
         Ok(())
     }
 
+    fn populate_table_plexos_parameters(
+        &self,
+        con: &mut duckdb::Connection,
+        _progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
+    ) -> Result<()> {
+        con.execute_batch(
+            "CREATE TABLE raw.plexos_parameters (
+                class_name VARCHAR,
+                object_name VARCHAR,
+                attribute_name VARCHAR,
+                value VARCHAR
+            );",
+        )?;
+
+        let Some(xml) = self.plexos_param_xml.as_deref() else {
+            return Ok(());
+        };
+        let document = roxmltree::Document::parse(xml)
+            .map_err(|error| eyre!("Failed to parse PLEXOS_Param.xml: {error}"))?;
+        let root = document.root_element();
+        if root.tag_name().name() != "UndocumentedParam" {
+            return Err(eyre!(
+                "Expected an UndocumentedParam root in PLEXOS_Param.xml"
+            ));
+        }
+
+        let mut appender = con.appender_to_db("plexos_parameters", "raw")?;
+        for record in root
+            .children()
+            .filter(|node| node.is_element() && node.tag_name().name() == "Attributes")
+        {
+            let values = ["Class", "Name", "Attribute", "Value"].map(|name| {
+                record
+                    .children()
+                    .find(|node| node.is_element() && node.tag_name().name() == name)
+                    .map(|node| node.text().unwrap_or_default())
+            });
+            appender.append_row(values)?;
+        }
+        appender.flush()?;
+        Ok(())
+    }
+
     fn populate_table_memberships(
         &self,
         con: &mut duckdb::Connection,
@@ -4274,6 +4349,9 @@ impl SolutionDataset {
         }
         if let Some(run_stats) = self.run_stats.as_ref() {
             appender.append_row(duckdb::params!["run_stats", run_stats])?;
+        }
+        if let Some(xml) = self.plexos_param_xml.as_ref() {
+            appender.append_row(duckdb::params!["plexos_param_xml", xml])?;
         }
         appender.flush()?;
         Ok(())
