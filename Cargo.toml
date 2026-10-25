@@ -31,10 +31,15 @@ zip = "9.0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap_complete = "4.6.11"
+quick-xml = "0.42.0"
+ahash = "0.8.12"
 
 [profile.release]
 debug = "full"
 strip = "none"
+
+[profile.release.package.libduckdb-sys]
+debug = false
 
 [[bin]]
 name = "plexos2duckdb"

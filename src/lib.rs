@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 #![doc = include_str!("../README.md")]
 
-use std::io::Read as _;
 use std::sync::{Arc, LazyLock};
 
 use color_eyre::{Result, eyre::eyre};
@@ -11,9 +10,279 @@ use duckdb::arrow::{
     record_batch::RecordBatch,
 };
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
-use roxmltree::{Document, Node};
+use roxmltree::Node;
 
+mod data_batches {
+    use color_eyre::{Result, eyre::eyre};
+    use duckdb::arrow::record_batch::RecordBatch;
+
+    pub(crate) struct Buffer {
+        batches: Vec<RecordBatch>,
+        rows: usize,
+        limit: usize,
+    }
+
+    impl Buffer {
+        pub(crate) fn new(limit: usize) -> Self {
+            Self {
+                batches: Vec::new(),
+                rows: 0,
+                limit,
+            }
+        }
+
+        pub(crate) fn push(
+            &mut self,
+            batch: RecordBatch,
+            write: &mut impl FnMut(RecordBatch) -> Result<()>,
+        ) -> Result<()> {
+            if batch.num_rows() > self.limit {
+                return Err(eyre!("Record batch exceeds the row limit"));
+            }
+            if self.rows + batch.num_rows() > self.limit {
+                self.flush(write)?;
+            }
+            self.rows += batch.num_rows();
+            self.batches.push(batch);
+            if self.rows == self.limit {
+                self.flush(write)?;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn flush(
+            &mut self,
+            write: &mut impl FnMut(RecordBatch) -> Result<()>,
+        ) -> Result<()> {
+            if self.batches.is_empty() {
+                return Ok(());
+            }
+            let batch = if self.batches.len() == 1 {
+                self.batches.pop().expect("one batch was checked")
+            } else {
+                duckdb::arrow::compute::concat_batches(&self.batches[0].schema(), &self.batches)?
+            };
+            self.batches.clear();
+            self.rows = 0;
+            write(batch)
+        }
+    }
+}
 pub mod utils;
+mod xml {
+    use std::io::BufRead;
+
+    use color_eyre::{Result, eyre::eyre};
+    use quick_xml::{Reader, events::Event};
+
+    struct CapturedReader<R> {
+        source: R,
+        bytes: Vec<u8>,
+        consumed: usize,
+    }
+
+    impl<R: std::io::Read> CapturedReader<R> {
+        fn new(source: R) -> Self {
+            Self {
+                source,
+                bytes: Vec::new(),
+                consumed: 0,
+            }
+        }
+
+        fn consumed_bytes(&self) -> &[u8] {
+            &self.bytes[..self.consumed]
+        }
+
+        fn take_batch(&mut self, prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
+            let mut next = Vec::with_capacity(self.bytes.capacity());
+            next.extend_from_slice(prefix);
+            next.extend_from_slice(&self.bytes[self.consumed..]);
+            let mut batch = std::mem::replace(&mut self.bytes, next);
+            batch.truncate(self.consumed);
+            batch.extend_from_slice(suffix);
+            self.consumed = prefix.len();
+            batch
+        }
+    }
+
+    impl<R: std::io::Read> std::io::Read for CapturedReader<R> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if output.is_empty() {
+                return Ok(0);
+            }
+            let available = self.fill_buf()?;
+            let count = output.len().min(available.len());
+            output[..count].copy_from_slice(&available[..count]);
+            self.consume(count);
+            Ok(count)
+        }
+    }
+
+    impl<R: std::io::Read> BufRead for CapturedReader<R> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.consumed == self.bytes.len() {
+                let start = self.bytes.len();
+                self.bytes.resize(start + 8192, 0);
+                match self.source.read(&mut self.bytes[start..]) {
+                    Ok(count) => self.bytes.truncate(start + count),
+                    Err(error) => {
+                        self.bytes.truncate(start);
+                        return Err(error);
+                    },
+                }
+            }
+            Ok(&self.bytes[self.consumed..])
+        }
+
+        fn consume(&mut self, count: usize) {
+            assert!(count <= self.bytes.len() - self.consumed);
+            self.consumed += count;
+        }
+    }
+
+    pub(crate) fn has_solution_root(source: impl BufRead) -> Result<bool> {
+        let mut reader = Reader::from_reader(source);
+        let mut buffer = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buffer)? {
+                Event::Start(start) | Event::Empty(start) => {
+                    return Ok(start.local_name().as_ref() == "SolutionDataset");
+                },
+                Event::Eof => return Ok(false),
+                _ => {},
+            }
+            buffer.clear();
+        }
+    }
+
+    pub(crate) fn read_records(
+        source: impl BufRead + Send,
+        mut visit: impl FnMut(roxmltree::Node<'_, '_>) -> Result<()>,
+    ) -> Result<()> {
+        std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+            let reader = scope.spawn(move || {
+                read_batches(source, |bytes| {
+                    sender
+                        .send(bytes)
+                        .map_err(|_| eyre!("XML record reader stopped"))
+                })
+            });
+            let result = receiver
+                .iter()
+                .try_for_each(|bytes| visit_batch(&bytes, &mut visit));
+            drop(receiver);
+            let reader_result = reader
+                .join()
+                .map_err(|_| eyre!("XML batch reader panicked"))?;
+            result?;
+            reader_result
+        })
+    }
+
+    fn read_batches(
+        source: impl BufRead,
+        mut emit: impl FnMut(Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        let mut reader = Reader::from_reader(CapturedReader::new(source));
+        reader.config_mut().check_comments = true;
+        let mut buffer = Vec::new();
+        let mut root_prefix = Vec::new();
+        let mut root_end = None;
+        let mut depth = 0usize;
+        let mut root_seen = false;
+        let mut root_closed = false;
+        let mut declaration_seen = false;
+
+        loop {
+            let event = reader.read_event_into(&mut buffer)?;
+            let mut opening_root = false;
+            match &event {
+                Event::Start(start) => {
+                    if depth == 0 {
+                        if root_seen {
+                            return Err(eyre!("XML contains more than one root element"));
+                        }
+                        root_seen = true;
+                        opening_root = true;
+                        root_end = Some(format!("</{}>", start.name().as_ref()).into_bytes());
+                    }
+                    depth += 1;
+                },
+                Event::Empty(_) if depth == 0 => {
+                    if root_seen {
+                        return Err(eyre!("XML contains more than one root element"));
+                    }
+                    root_seen = true;
+                    root_closed = true;
+                },
+                Event::End(_) => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| eyre!("Unexpected XML closing tag"))?;
+                    if depth == 0 {
+                        root_closed = true;
+                    }
+                },
+                Event::Text(text) if depth == 0 => {
+                    if text
+                        .as_ref()
+                        .as_bytes()
+                        .iter()
+                        .any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                    {
+                        return Err(eyre!("Text outside the XML root element"));
+                    }
+                },
+                Event::CData(_) if depth == 0 => {
+                    return Err(eyre!("CDATA outside the XML root element"));
+                },
+                Event::Decl(_) => {
+                    if root_seen || declaration_seen {
+                        return Err(eyre!("Unexpected XML declaration"));
+                    }
+                    declaration_seen = true;
+                },
+                Event::DocType(_) => return Err(eyre!("XML DTD is not supported")),
+                Event::Eof => {
+                    if !root_closed || depth != 0 {
+                        return Err(eyre!("Missing or unclosed XML root element"));
+                    }
+                    return emit(reader.get_mut().take_batch(&[], &[]));
+                },
+                _ => {},
+            }
+
+            if opening_root {
+                root_prefix = reader.get_ref().consumed_bytes().to_vec();
+            }
+            if depth == 1 && reader.get_ref().consumed_bytes().len() >= 262_144 {
+                let bytes = reader
+                    .get_mut()
+                    .take_batch(&root_prefix, root_end.as_ref().expect("root is open"));
+                emit(bytes)?;
+            }
+            buffer.clear();
+        }
+    }
+
+    fn visit_batch(
+        bytes: &[u8],
+        visit: &mut impl FnMut(roxmltree::Node<'_, '_>) -> Result<()>,
+    ) -> Result<()> {
+        let text = std::str::from_utf8(bytes)?;
+        let doc = roxmltree::Document::parse(text)?;
+        for record in doc
+            .root_element()
+            .children()
+            .filter(roxmltree::Node::is_element)
+        {
+            visit(record)?;
+        }
+        Ok(())
+    }
+}
 
 const DATA_APPEND_BATCH_VALUES: u64 = 262_144;
 
@@ -295,12 +564,6 @@ struct TableMetadataCacheKey {
     is_summary: bool,
 }
 
-#[derive(Debug)]
-struct TableMetadata {
-    table_name: String,
-    unit_name: String,
-}
-
 #[derive(Debug, Default, Clone)]
 struct AttributeData {
     object_id: Option<i64>,
@@ -363,6 +626,12 @@ struct MemoObject {
     value: String,
     column_id: i64,
     object_id: i64,
+}
+
+#[derive(Debug)]
+struct ZipXmlSource {
+    archive: zip::ZipArchive<std::fs::File>,
+    index: usize,
 }
 
 #[derive(Debug)]
@@ -573,7 +842,7 @@ impl PeriodData {
 pub struct SolutionDataset {
     file: std::path::PathBuf,
     model_name: String,
-    attribute_data: indexmap::IndexMap<i64, AttributeData>,
+    attribute_data: Vec<AttributeData>,
     attribute: indexmap::IndexMap<i64, Attribute>,
     band: indexmap::IndexMap<i64, Band>,
     category: indexmap::IndexMap<i64, Category>,
@@ -582,15 +851,15 @@ pub struct SolutionDataset {
     collection: indexmap::IndexMap<i64, Collection>,
     membership: indexmap::IndexMap<i64, Membership>,
     config: indexmap::IndexMap<String, Option<String>>,
-    key_index: indexmap::IndexMap<i64, KeyIndex>,
-    key: indexmap::IndexMap<i64, Key>,
+    key_index: Vec<KeyIndex>,
+    key: indexmap::IndexMap<i64, Key, ahash::RandomState>,
     model: indexmap::IndexMap<i64, Model>,
     object: indexmap::IndexMap<i64, Object>,
     period: std::collections::HashMap<String, indexmap::IndexMap<i64, PeriodType>>,
     property: indexmap::IndexMap<i64, Property>,
     phase: std::collections::HashMap<String, indexmap::IndexMap<i64, PhaseType>>,
     sample: indexmap::IndexMap<i64, Sample>,
-    sample_weight: indexmap::IndexMap<i64, SampleWeight>,
+    sample_weight: Vec<SampleWeight>,
     timeslice: indexmap::IndexMap<i64, Timeslice>,
     unit: indexmap::IndexMap<i64, Unit>,
     memo_object: Vec<MemoObject>,
@@ -600,7 +869,7 @@ pub struct SolutionDataset {
     run_stats: Option<String>,
     // calculated fields
     timestamp_block: std::collections::HashMap<String, Vec<(chrono::DateTime<chrono::Utc>, i64)>>,
-    table_key_index_mapping: std::collections::HashMap<String, Vec<i64>>,
+    table_key_index_mapping: std::collections::HashMap<String, Vec<usize>>,
     table_units_mapping: std::collections::HashMap<String, (String, i64)>,
 }
 
@@ -645,7 +914,7 @@ enum DuckdbProgress {
 #[derive(Debug, Clone)]
 struct DataTableWritePlan {
     table_name: String,
-    key_ids: Vec<i64>,
+    index_ids: Vec<usize>,
     estimated_values: u128,
 }
 
@@ -871,7 +1140,7 @@ impl SolutionDataset {
         path: &std::path::Path,
         model_name: &str,
         report: &mut Option<&mut dyn FnMut(&str)>,
-    ) -> Result<(String, indexmap::IndexMap<i64, PeriodData>)> {
+    ) -> Result<(ZipXmlSource, indexmap::IndexMap<i64, PeriodData>)> {
         Self::report_progress(report, "Opening ZIP archive");
         let archive_file = Arc::new(std::fs::File::open(path)?);
 
@@ -884,10 +1153,10 @@ impl SolutionDataset {
         let mut archive = zip::ZipArchive::new(archive_file.try_clone()?)?;
 
         Self::report_progress(report, "Selecting XML inside ZIP archive");
-        let mut xml_content = String::new();
         let mut preferred_xml_index = None;
         let mut model_name_xml_index = None;
         let mut first_xml_index = None;
+        let mut xml_indices = Vec::new();
 
         let model_name = if !model_name.is_empty() {
             Some(model_name.to_lowercase())
@@ -909,6 +1178,7 @@ impl SolutionDataset {
             let file_name = file.name()?.into_owned();
             let file_name_lower = file_name.to_lowercase();
             if file_name_lower.ends_with(".xml") {
+                xml_indices.push(i);
                 if let Some(stem) = std::path::Path::new(&file_name)
                     .file_stem()
                     .map(|s| s.to_string_lossy())
@@ -932,11 +1202,27 @@ impl SolutionDataset {
             }
         }
 
+        let mut solution_xml_index = None;
+        if preferred_xml_index.is_none() && model_name_xml_index.is_none() {
+            for idx in xml_indices {
+                if xml::has_solution_root(std::io::BufReader::new(archive.by_index(idx)?))? {
+                    solution_xml_index = Some(idx);
+                    break;
+                }
+            }
+        }
+
         let xml_index_to_use = if let Some(idx) = preferred_xml_index {
             idx
         } else if let Some(idx) = model_name_xml_index {
             eprintln!(
                 "Warning: Expected XML file named '{}.xml', using XML file containing model name instead.",
+                zip_stem
+            );
+            idx
+        } else if let Some(idx) = solution_xml_index {
+            eprintln!(
+                "Warning: Expected XML file named '{}.xml', using XML with a SolutionDataset root instead.",
                 zip_stem
             );
             idx
@@ -950,11 +1236,6 @@ impl SolutionDataset {
         } else {
             return Err(eyre!("No XML file found in the zip archive"));
         };
-
-        Self::report_progress(report, "Reading XML from ZIP archive");
-        let mut file = archive.by_index(xml_index_to_use)?;
-        file.read_to_string(&mut xml_content)?;
-        drop(file);
 
         Self::report_progress(report, "Indexing BIN files");
         let mut period_data = indexmap::IndexMap::new();
@@ -995,7 +1276,13 @@ impl SolutionDataset {
             }
         }
 
-        Ok((xml_content, period_data))
+        Ok((
+            ZipXmlSource {
+                archive,
+                index: xml_index_to_use,
+            },
+            period_data,
+        ))
     }
 
     fn with_zip_file_impl<P: AsRef<std::path::Path>>(
@@ -1004,14 +1291,15 @@ impl SolutionDataset {
         mut report: Option<&mut dyn FnMut(&str)>,
     ) -> Result<Self> {
         let path = path.as_ref();
-        let (xml_content, period_data) =
+        let (mut source, period_data) =
             Self::read_zip_archive(path, &self.model_name, &mut report)?;
-        Self::report_progress(&mut report, "Parsing XML");
-        let mut ds = self
+        Self::report_progress(&mut report, "Reading XML from ZIP archive");
+        let file = source.archive.by_index(source.index)?;
+        let mut dataset = self
             .with_file(path)
-            .with_xml_string_impl(&xml_content, report)?;
-        ds.period_data = period_data;
-        Ok(ds)
+            .with_xml_reader_impl(std::io::BufReader::new(file), report)?;
+        dataset.period_data = period_data;
+        Ok(dataset)
     }
 
     pub fn with_xml_file<P: AsRef<std::path::Path>>(self, path: P) -> Result<Self> {
@@ -1032,39 +1320,34 @@ impl SolutionDataset {
         mut report: Option<&mut dyn FnMut(&str)>,
     ) -> Result<Self> {
         Self::report_progress(&mut report, "Reading XML file");
-        let mut file = std::fs::File::open(path)?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)?;
+        let file = std::fs::File::open(path)?;
         Self::report_progress(&mut report, "Parsing XML");
-        self.with_xml_string_impl(&content, report)
+        self.with_xml_reader_impl(std::io::BufReader::new(file), report)
     }
 
     pub fn with_xml_string(self, xml: &str) -> Result<Self> {
-        self.with_xml_string_impl(xml, None)
+        self.with_xml_reader_impl(xml.as_bytes(), None)
     }
 
-    fn with_xml_string_impl(
+    fn with_xml_reader_impl(
         mut self,
-        xml: &str,
+        reader: impl std::io::BufRead + Send,
         mut report: Option<&mut dyn FnMut(&str)>,
     ) -> Result<Self> {
         Self::report_progress(&mut report, "Parsing XML document");
-        let doc = Document::parse(xml)?;
-
-        let root = doc.root_element();
         self.initialize_xml_record_maps();
 
         let mut last_tag = None;
-        for record_node in root.children().filter(Node::is_element) {
+        xml::read_records(reader, |record_node| {
             let tag = record_node.tag_name().name();
-            if last_tag != Some(tag) {
+            if last_tag.as_deref() != Some(tag) {
                 if let Some(label) = xml_record_progress_label(tag) {
                     Self::report_progress(&mut report, label);
                 }
-                last_tag = Some(tag);
+                last_tag = Some(tag.to_owned());
             }
-            self.parse_xml_record(tag, &record_node)?;
-        }
+            self.parse_xml_record(tag, &record_node)
+        })?;
 
         Self::report_progress(&mut report, "Sorting XML records");
         self.sort_xml_records();
@@ -1130,7 +1413,8 @@ impl SolutionDataset {
     }
 
     fn sort_xml_records(&mut self) {
-        sort_index_map_if_needed(&mut self.attribute_data);
+        self.attribute_data
+            .sort_by_key(|data| (data.object_id, data.attribute_id));
         sort_index_map_if_needed(&mut self.attribute);
         sort_index_map_if_needed(&mut self.band);
         sort_index_map_if_needed(&mut self.category);
@@ -1139,13 +1423,15 @@ impl SolutionDataset {
         sort_index_map_if_needed(&mut self.collection);
         sort_index_map_if_needed(&mut self.membership);
         sort_index_map_if_needed(&mut self.config);
-        sort_index_map_if_needed(&mut self.key_index);
+        self.key_index
+            .sort_by_key(|index| (index.key_id, index.period_type_id));
         sort_index_map_if_needed(&mut self.key);
         sort_index_map_if_needed(&mut self.model);
         sort_index_map_if_needed(&mut self.object);
         sort_index_map_if_needed(&mut self.property);
         sort_index_map_if_needed(&mut self.sample);
-        sort_index_map_if_needed(&mut self.sample_weight);
+        self.sample_weight
+            .sort_by_key(|weight| (weight.sample_id, weight.phase_id));
         sort_index_map_if_needed(&mut self.timeslice);
         sort_index_map_if_needed(&mut self.unit);
         sort_index_map_if_needed(&mut self.custom_column);
@@ -1442,7 +1728,7 @@ impl SolutionDataset {
             length: required_xml_field(length, "length", key_index_node)?,
             period_offset: required_xml_field(period_offset, "period_offset", key_index_node)?,
         };
-        self.key_index.insert(key_index.key_id, key_index);
+        self.key_index.push(key_index);
         Ok(())
     }
 
@@ -1656,8 +1942,7 @@ impl SolutionDataset {
             phase_id,
             weight,
         };
-        self.sample_weight
-            .insert(sample_weight.sample_id, sample_weight);
+        self.sample_weight.push(sample_weight);
         Ok(())
     }
 
@@ -1671,7 +1956,12 @@ impl SolutionDataset {
     }
 
     fn parse_attribute_data(&mut self, attribute_node: &Node) -> Result<()> {
-        let object_id = get_child(attribute_node, "object_id").ok();
+        let object_id = attribute_node
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == "object_id")
+            .filter(|node| node.text().is_some())
+            .map(|node| parse_element_text(&node))
+            .transpose()?;
         let attribute_id = get_child(attribute_node, "attribute_id")?;
         let value = get_child(attribute_node, "value")?;
 
@@ -1680,8 +1970,7 @@ impl SolutionDataset {
             attribute_id,
             value,
         };
-        self.attribute_data
-            .insert(attribute_data.attribute_id, attribute_data);
+        self.attribute_data.push(attribute_data);
         Ok(())
     }
 
@@ -1789,16 +2078,24 @@ impl SolutionDataset {
     }
 
     fn update_table_key_indexes_mapping(&mut self) -> Result<()> {
-        let mut key_indexes_mapping: std::collections::HashMap<String, Vec<i64>> =
-            Default::default();
-        let mut units_mapping: std::collections::HashMap<String, (String, i64)> =
-            Default::default();
-        let mut metadata_cache: std::collections::HashMap<TableMetadataCacheKey, TableMetadata> =
-            Default::default();
+        let mut tables: indexmap::IndexMap<String, Vec<usize>> = Default::default();
+        let mut table_positions: std::collections::HashMap<
+            TableMetadataCacheKey,
+            usize,
+            ahash::RandomState,
+        > = Default::default();
+        let mut keys = self.key.values().peekable();
 
-        for ki in self.key_index.values() {
+        for (index_id, ki) in self.key_index.iter().enumerate() {
             let key_id = ki.key_id;
-            let key = self.key(key_id)?;
+            while keys.peek().is_some_and(|key| key.key_id < key_id) {
+                keys.next();
+            }
+            let key = keys
+                .peek()
+                .copied()
+                .filter(|key| key.key_id == key_id)
+                .ok_or_else(|| eyre!("Key with {key_id} not found"))?;
             let membership = self.membership(key.membership_id)?;
             let cache_key = TableMetadataCacheKey {
                 phase_id: key.phase_id,
@@ -1808,7 +2105,7 @@ impl SolutionDataset {
                 is_summary: key.is_summary,
             };
 
-            let metadata = match metadata_cache.entry(cache_key) {
+            let table_position = *match table_positions.entry(cache_key) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let phase_name = self.phase_name(cache_key.phase_id);
@@ -1825,7 +2122,7 @@ impl SolutionDataset {
                     } else {
                         property.unit_id
                     };
-                    let unit = self.unit(unit_id)?;
+                    self.unit(unit_id)?;
                     let table_name = format!(
                         "{phase_name}__{period_name}__{}__{property_name}",
                         collection.name
@@ -1833,31 +2130,36 @@ impl SolutionDataset {
                     .replace(" ", "_")
                     .replace("-", "_");
 
-                    entry.insert(TableMetadata {
-                        table_name,
-                        unit_name: unit.value.clone(),
-                    })
+                    let table_entry = tables.entry(table_name);
+                    let table_position = table_entry.index();
+                    table_entry.or_default();
+                    entry.insert(table_position)
                 },
             };
-            if let Some(key_ids) = key_indexes_mapping.get_mut(metadata.table_name.as_str()) {
-                key_ids.push(key_id);
+            let (_, index_ids) = tables
+                .get_index_mut(table_position)
+                .ok_or_else(|| eyre!("Table position {table_position} not found"))?;
+            index_ids.push(index_id);
+        }
+        let key_indexes_mapping: std::collections::HashMap<String, Vec<usize>> =
+            tables.into_iter().collect();
+        let mut units_mapping = std::collections::HashMap::with_capacity(key_indexes_mapping.len());
+        for (table_name, index_ids) in &key_indexes_mapping {
+            let index_id = index_ids
+                .last()
+                .ok_or_else(|| eyre!("No key indexes for {table_name}"))?;
+            let index = self.key_index(*index_id)?;
+            let key = self.key(index.key_id)?;
+            let property = self.property(key.property_id)?;
+            let unit_id = if property.is_summary {
+                property.summary_unit_id
             } else {
-                key_indexes_mapping.insert(metadata.table_name.clone(), vec![key_id]);
-            }
-
-            if let Some((unit_name, period_offset)) =
-                units_mapping.get_mut(metadata.table_name.as_str())
-            {
-                if unit_name != &metadata.unit_name {
-                    unit_name.clone_from(&metadata.unit_name);
-                }
-                *period_offset = ki.period_offset;
-            } else {
-                units_mapping.insert(
-                    metadata.table_name.clone(),
-                    (metadata.unit_name.clone(), ki.period_offset),
-                );
-            }
+                property.unit_id
+            };
+            units_mapping.insert(
+                table_name.clone(),
+                (self.unit(unit_id)?.value.clone(), index.period_offset),
+            );
         }
         self.table_key_index_mapping = key_indexes_mapping;
         self.table_units_mapping = units_mapping;
@@ -2251,7 +2553,7 @@ impl SolutionDataset {
 
         if external_data_parquet_dir.is_none() {
             for plan in &plans {
-                self.create_data_table(con, plan.table_name.as_str())?;
+                self.create_data_table(con, plan)?;
             }
         }
 
@@ -2265,8 +2567,8 @@ impl SolutionDataset {
             progress,
         )?;
 
-        let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
         if let Some(external_data_parquet_dir) = external_data_parquet_dir.as_deref() {
+            let worker_count = Self::resolve_data_write_threads(total_tables, data_write_threads);
             self.populate_table_data_external_parquet(
                 con,
                 plans,
@@ -2279,7 +2581,7 @@ impl SolutionDataset {
             self.populate_table_data_direct(
                 con,
                 plans,
-                worker_count,
+                data_write_threads,
                 materialized_period_data.as_ref(),
                 progress,
             )
@@ -2301,14 +2603,14 @@ impl SolutionDataset {
         data_table_name_pattern: Option<&regex::Regex>,
     ) -> Result<Vec<DataTableWritePlan>> {
         let mut plans = Vec::with_capacity(self.table_key_index_mapping.len());
-        for (table_name, key_ids) in self.table_key_index_mapping.iter() {
+        for (table_name, index_ids) in self.table_key_index_mapping.iter() {
             if !Self::data_table_name_matches(table_name, data_table_name_pattern) {
                 continue;
             }
 
             let mut estimated_values = 0u128;
-            for key_id in key_ids.iter().copied() {
-                let length = self.key_index(key_id)?.length;
+            for index_id in index_ids.iter().copied() {
+                let length = self.key_index(index_id)?.length;
                 estimated_values = estimated_values
                     .checked_add(u128::from(length))
                     .ok_or_else(|| {
@@ -2321,7 +2623,7 @@ impl SolutionDataset {
 
             plans.push(DataTableWritePlan {
                 table_name: table_name.clone(),
-                key_ids: key_ids.clone(),
+                index_ids: index_ids.clone(),
                 estimated_values,
             });
         }
@@ -2329,23 +2631,70 @@ impl SolutionDataset {
         plans.sort_by(|a, b| {
             b.estimated_values
                 .cmp(&a.estimated_values)
-                .then_with(|| b.key_ids.len().cmp(&a.key_ids.len()))
+                .then_with(|| b.index_ids.len().cmp(&a.index_ids.len()))
                 .then_with(|| a.table_name.cmp(&b.table_name))
         });
         Ok(plans)
     }
 
-    fn resolve_data_write_threads(total_tables: usize, configured_threads: Option<usize>) -> usize {
+    fn resolve_data_write_threads(total_tasks: usize, configured_threads: Option<usize>) -> usize {
         const MAX_AUTO_DATA_WRITE_THREADS: usize = 8;
 
         match configured_threads {
-            Some(threads) => threads.max(1).min(total_tables),
+            Some(threads) => threads.max(1).min(total_tasks),
             None => std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
                 .min(MAX_AUTO_DATA_WRITE_THREADS)
-                .min(total_tables),
+                .min(total_tasks),
         }
+    }
+
+    fn partition_data_table_plans(
+        &self,
+        plans: Vec<DataTableWritePlan>,
+        worker_count: usize,
+    ) -> Result<Vec<DataTableWritePlan>> {
+        if worker_count <= 1 {
+            return Ok(plans);
+        }
+        let total_values = plans.iter().try_fold(0u128, |total, plan| {
+            total
+                .checked_add(plan.estimated_values)
+                .ok_or_else(|| eyre!("Estimated data write workload overflow"))
+        })?;
+        const PARTITIONS_PER_WORKER: u128 = 4;
+        let target_values = total_values
+            .div_ceil(worker_count as u128 * PARTITIONS_PER_WORKER)
+            .max(u128::from(DATA_APPEND_BATCH_VALUES));
+        let mut partitions = Vec::new();
+        for plan in plans {
+            if plan.estimated_values <= target_values || plan.index_ids.len() < 2 {
+                partitions.push(plan);
+                continue;
+            }
+            let mut index_ids = Vec::new();
+            let mut estimated_values = 0u128;
+            for index_id in plan.index_ids {
+                if estimated_values >= target_values {
+                    partitions.push(DataTableWritePlan {
+                        table_name: plan.table_name.clone(),
+                        index_ids: std::mem::take(&mut index_ids),
+                        estimated_values,
+                    });
+                    estimated_values = 0;
+                }
+                estimated_values += u128::from(self.key_index(index_id)?.length);
+                index_ids.push(index_id);
+            }
+            partitions.push(DataTableWritePlan {
+                table_name: plan.table_name,
+                index_ids,
+                estimated_values,
+            });
+        }
+        partitions.sort_by_key(|plan| std::cmp::Reverse(plan.estimated_values));
+        Ok(partitions)
     }
 
     fn compressed_period_type_ids_for_plans(
@@ -2355,8 +2704,8 @@ impl SolutionDataset {
         let mut period_type_ids = std::collections::BTreeSet::new();
 
         for plan in plans {
-            for key_id in plan.key_ids.iter().copied() {
-                let ki = self.key_index(key_id)?;
+            for index_id in plan.index_ids.iter().copied() {
+                let ki = self.key_index(index_id)?;
                 let period_data = self
                     .period_data
                     .get(&ki.period_type_id)
@@ -2424,11 +2773,19 @@ impl SolutionDataset {
         &self,
         con: &duckdb::Connection,
         plans: Vec<DataTableWritePlan>,
-        worker_count: usize,
+        configured_threads: Option<usize>,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
         let total_tables = plans.len();
+        let total_tasks = plans.iter().map(|plan| plan.index_ids.len().max(1)).sum();
+        let worker_count = Self::resolve_data_write_threads(total_tasks, configured_threads);
+        let plans = self.partition_data_table_plans(plans, worker_count)?;
+        let mut table_progress = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        for plan in &plans {
+            let (remaining_parts, _) = table_progress.entry(plan.table_name.clone()).or_default();
+            *remaining_parts += 1;
+        }
         let worker_plans = Self::distribute_data_table_plans(plans, worker_count);
         Self::report_duckdb_progress(
             progress,
@@ -2513,6 +2870,17 @@ impl SolutionDataset {
                             }));
                         }
 
+                        let (remaining_parts, completed_keys) = table_progress
+                            .get_mut(&table_name)
+                            .ok_or_else(|| eyre!("Unexpected completed table: {table_name}"))?;
+                        *remaining_parts = remaining_parts.checked_sub(1).ok_or_else(|| {
+                            eyre!("Too many completed partitions for table: {table_name}")
+                        })?;
+                        *completed_keys += keys;
+                        if *remaining_parts != 0 {
+                            continue;
+                        }
+                        let keys = *completed_keys;
                         completed_tables += 1;
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataTableStart {
@@ -2549,7 +2917,7 @@ impl SolutionDataset {
         for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
             let worker_table_index = worker_table_idx + 1;
             let table_name = table_plan.table_name.clone();
-            let keys = table_plan.key_ids.len();
+            let keys = table_plan.index_ids.len();
             let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
                 worker_id: worker_idx,
                 index: worker_table_index,
@@ -2558,6 +2926,7 @@ impl SolutionDataset {
                 keys,
             });
 
+            con.execute_batch("BEGIN TRANSACTION;")?;
             let mut appender = con.appender_to_db(&table_name, "data")?;
             self.write_data_table_to_appender(
                 &mut appender,
@@ -2566,6 +2935,7 @@ impl SolutionDataset {
             )?;
             appender.flush()?;
             drop(appender);
+            con.execute_batch("COMMIT;")?;
 
             let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
                 worker_id: worker_idx,
@@ -2756,7 +3126,7 @@ impl SolutionDataset {
         for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
             let worker_table_index = worker_table_idx + 1;
             let table_name = table_plan.table_name.clone();
-            let keys = table_plan.key_ids.len();
+            let keys = table_plan.index_ids.len();
             let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
                 worker_id: worker_idx,
                 index: worker_table_index,
@@ -2808,8 +3178,11 @@ impl SolutionDataset {
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         mut write_batch: impl FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
-        for key_id in plan.key_ids.iter().copied() {
-            let ki = self.key_index(key_id)?;
+        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
+        let mut batches = data_batches::Buffer::new(DATA_APPEND_BATCH_VALUES as usize);
+        for index_id in plan.index_ids.iter().copied() {
+            let ki = self.key_index(index_id)?;
+            let key_id = ki.key_id;
             let key = self.key(key_id)?;
 
             if ki.position % 8 != 0 {
@@ -2831,10 +3204,15 @@ impl SolutionDataset {
                 value_count: ki.length,
                 period_offset: ki.period_offset,
             };
-            self.write_data_range_task_batches(&task, materialized_period_data, &mut write_batch)?;
+            self.write_data_range_task_batches(
+                &task,
+                materialized_period_data,
+                &mut chunk_buf,
+                |batch| batches.push(batch, &mut write_batch),
+            )?;
         }
 
-        Ok(())
+        batches.flush(&mut write_batch)
     }
 
     fn open_data_parquet_writer(path: &std::path::Path) -> Result<ArrowWriter<std::fs::File>> {
@@ -2854,19 +3232,23 @@ impl SolutionDataset {
         &self,
         task: &DataRangeWriteTask,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
+        chunk_buf: &mut [u8],
         mut write_batch: impl FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
         if let Some(file) = materialized_period_data.and_then(|data| data.get(task.period_type_id))
         {
-            return Self::write_data_range_task_batches_from_file(file, task, &mut write_batch);
+            return Self::write_data_range_task_batches_from_file(
+                file,
+                task,
+                chunk_buf,
+                &mut write_batch,
+            );
         }
 
         let period_data = self
             .period_data
             .get(&task.period_type_id)
             .ok_or_else(|| eyre!("period type not found: {}", task.period_type_id))?;
-
-        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
         let mut value_offset = 0u64;
 
         while value_offset < task.value_count {
@@ -2908,9 +3290,9 @@ impl SolutionDataset {
     fn write_data_range_task_batches_from_file(
         file: &std::fs::File,
         task: &DataRangeWriteTask,
+        chunk_buf: &mut [u8],
         write_batch: &mut impl FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
-        let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
         let mut value_offset = 0u64;
 
         while value_offset < task.value_count {
@@ -3038,16 +3420,34 @@ impl SolutionDataset {
         files_by_table
     }
 
-    fn create_data_table(&self, con: &mut duckdb::Connection, table_name: &str) -> Result<()> {
-        let table_ident = Self::quote_ident(table_name);
+    fn create_data_table(
+        &self,
+        con: &mut duckdb::Connection,
+        plan: &DataTableWritePlan,
+    ) -> Result<()> {
+        let vector_size = con.query_row(
+            "SELECT current_setting('standard_vector_size')",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let mut metadata_compression = "USING COMPRESSION rle";
+        let mut block_id_compression = "USING COMPRESSION bitpacking";
+        for index_id in &plan.index_ids {
+            if self.key_index(*index_id)?.length < vector_size {
+                metadata_compression = "";
+                block_id_compression = "";
+                break;
+            }
+        }
+        let table_ident = Self::quote_ident(&plan.table_name);
         con.execute_batch(&format!(
             r#"
             CREATE TABLE data.{table_ident} (
-              key_id BIGINT,
-              sample_id BIGINT,
-              band_id BIGINT,
-              membership_id BIGINT,
-              block_id BIGINT,
+              key_id BIGINT {metadata_compression},
+              sample_id BIGINT {metadata_compression},
+              band_id BIGINT {metadata_compression},
+              membership_id BIGINT {metadata_compression},
+              block_id BIGINT {block_id_compression},
               value DOUBLE
             )
         "#
@@ -3591,18 +3991,19 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.key_indexes (
-                key_id BIGINT PRIMARY KEY,
+                key_id BIGINT,
                 period_type_id BIGINT,
                 position UBIGINT,
                 length UBIGINT,
                 period_offset BIGINT,
+                PRIMARY KEY (key_id, period_type_id)
               );
               ",
         )?;
 
         let mut appender = con.appender_to_db("key_indexes", "raw")?;
 
-        for key_index in self.key_index.values() {
+        for key_index in &self.key_index {
             appender.append_row(duckdb::params![
                 key_index.key_id,
                 key_index.period_type_id,
@@ -3688,30 +4089,30 @@ impl SolutionDataset {
         con.execute_batch(
             "
               CREATE TABLE raw.samples (
-                sample_id BIGINT PRIMARY KEY,
+                sample_id BIGINT,
                 sample_name VARCHAR,
                 sample_phase_id BIGINT,
                 sample_weight DOUBLE,
+                PRIMARY KEY (sample_id, sample_phase_id)
               );
               ",
         )?;
         let mut appender = con.appender_to_db("samples", "raw")?;
-        for (_, sample) in self.sample.iter() {
-            let sample_weight = self
-                .sample_weight(sample.sample_id)
-                .cloned()
-                .unwrap_or_else(|_| SampleWeight {
-                    sample_id: sample.sample_id,
-                    phase_id: 0,
-                    weight: 0.0,
-                });
-
+        let mut weighted_samples = std::collections::HashSet::new();
+        for sample_weight in &self.sample_weight {
+            let sample = self.sample(sample_weight.sample_id)?;
             appender.append_row(duckdb::params![
                 sample.sample_id,
                 sample.name,
                 sample_weight.phase_id,
                 sample_weight.weight
             ])?;
+            weighted_samples.insert(sample.sample_id);
+        }
+        for sample in self.sample.values() {
+            if !weighted_samples.contains(&sample.sample_id) {
+                appender.append_row(duckdb::params![sample.sample_id, sample.name, 0, 0.0])?;
+            }
         }
         appender.flush()?;
 
@@ -3808,10 +4209,12 @@ impl SolutionDataset {
               ",
         )?;
         let mut appender = con.appender_to_db("attribute_data", "raw")?;
-        for (_, data) in self.attribute_data.iter() {
-            if let Some(object_id) = data.object_id {
-                appender.append_row(duckdb::params![object_id, data.attribute_id, data.value])?;
-            }
+        for data in &self.attribute_data {
+            appender.append_row(duckdb::params![
+                data.object_id,
+                data.attribute_id,
+                data.value
+            ])?;
         }
         appender.flush()?;
 
@@ -3908,10 +4311,14 @@ impl SolutionDataset {
     ) -> Result<()> {
         con.execute_batch("CREATE SCHEMA IF NOT EXISTS report;")?;
 
-        for table_name in self.table_key_index_mapping.keys() {
+        for (table_name, index_ids) in &self.table_key_index_mapping {
             if !Self::data_table_name_matches(table_name, data_table_name_pattern) {
                 continue;
             }
+            let index_id = index_ids
+                .first()
+                .ok_or_else(|| eyre!("No key indexes for {table_name}"))?;
+            let phase_id = self.key(self.key_index(*index_id)?.key_id)?.phase_id;
 
             let phase_name = table_name
                 .split("__")
@@ -3961,7 +4368,14 @@ impl SolutionDataset {
                   pr.unit AS unit,
                   FROM
                     data.\"{table_name}\" d
-                    LEFT JOIN raw.samples s ON d.sample_id = s.sample_id
+                    LEFT JOIN (
+                      SELECT sample_id, sample_name
+                      FROM raw.samples
+                      QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY sample_id
+                        ORDER BY sample_phase_id = {phase_id} DESC, sample_phase_id
+                      ) = 1
+                    ) s ON d.sample_id = s.sample_id
                     LEFT JOIN processed.memberships m ON d.membership_id = m.membership_id
                     {timestamp_join}
                     LEFT JOIN raw.keys k ON d.key_id = k.key_id
@@ -4178,22 +4592,16 @@ impl SolutionDataset {
             .ok_or_else(|| eyre!("Sample not found for {sample_id}"))
     }
 
-    fn sample_weight(&self, sample_id: i64) -> Result<&SampleWeight> {
-        self.sample_weight
-            .get(&sample_id)
-            .ok_or_else(|| eyre!("Sample weight not found for {sample_id}"))
-    }
-
     fn timeslice(&self, timeslice_id: i64) -> Result<&Timeslice> {
         self.timeslice
             .get(&timeslice_id)
             .ok_or_else(|| eyre!("Timeslice not found for {timeslice_id}"))
     }
 
-    fn key_index(&self, key_id: i64) -> Result<&KeyIndex> {
+    fn key_index(&self, index_id: usize) -> Result<&KeyIndex> {
         self.key_index
-            .get(&key_id)
-            .ok_or_else(|| eyre!("Key index not found for {key_id}"))
+            .get(index_id)
+            .ok_or_else(|| eyre!("Key index not found at position {index_id}"))
     }
 
     fn membership_name(&self, membership_id: i64) -> Result<String> {
@@ -4342,7 +4750,7 @@ impl SolutionDataset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
 
     fn build_small_database() -> Result<(tempfile::TempDir, std::path::PathBuf)> {
         let output_dir = tempfile::TempDir::new()?;
@@ -4427,8 +4835,8 @@ mod tests {
         let bin_path = output_dir.path().join("t_data_0.BIN");
         let mut bin_file = std::fs::File::create(&bin_path)?;
 
-        let mut key = indexmap::IndexMap::new();
-        let mut key_index = indexmap::IndexMap::new();
+        let mut key = indexmap::IndexMap::with_hasher(ahash::RandomState::new());
+        let mut key_index = Vec::new();
         let mut table_key_index_mapping = std::collections::HashMap::new();
         let mut byte_position = 0u64;
 
@@ -4456,17 +4864,15 @@ mod tests {
                     timeslice_id: 0,
                 },
             );
-            key_index.insert(
+            let index_id = key_index.len();
+            key_index.push(KeyIndex {
                 key_id,
-                KeyIndex {
-                    key_id,
-                    period_type_id: 0,
-                    length: u64::try_from(values.len())?,
-                    position: byte_position,
-                    period_offset,
-                },
-            );
-            table_key_index_mapping.insert(table_name.to_string(), vec![key_id]);
+                period_type_id: 0,
+                length: u64::try_from(values.len())?,
+                position: byte_position,
+                period_offset,
+            });
+            table_key_index_mapping.insert(table_name.to_string(), vec![index_id]);
             let bytes_written = u64::try_from(values.len())?
                 .checked_mul(8)
                 .ok_or_else(|| eyre!("test BIN byte length overflow"))?;
@@ -4575,6 +4981,334 @@ mod tests {
     }
 
     #[test]
+    fn table_units_use_the_last_index_and_validate_earlier_units() -> Result<()> {
+        let mut dataset = SolutionDataset::default()
+            .with_zip_file("tests/data/plexos-solution-files/Model_Base_LT_Solution.zip")?;
+        let (table_name, indexes) = dataset
+            .table_key_index_mapping
+            .iter()
+            .filter(|(_, indexes)| indexes.len() > 1)
+            .min_by(|left, right| left.0.cmp(right.0))
+            .map(|(name, indexes)| (name.clone(), indexes.clone()))
+            .ok_or_else(|| eyre!("fixture needs a table with multiple keys"))?;
+        dataset.key_index = indexes
+            .iter()
+            .map(|index| dataset.key_index[*index].clone())
+            .collect();
+        let first_key = dataset.key_index.first().expect("multiple indexes").key_id;
+        let last_key = dataset.key_index.last().expect("multiple indexes").key_id;
+        assert_ne!(first_key, last_key);
+        let unit_id = i64::MAX;
+        assert!(
+            dataset
+                .unit
+                .insert(
+                    unit_id,
+                    Unit {
+                        id: unit_id,
+                        value: "last-unit".to_owned(),
+                        ..Default::default()
+                    }
+                )
+                .is_none()
+        );
+        let mut property = dataset
+            .property(dataset.key(last_key)?.property_id)?
+            .clone();
+        property.property_id = i64::MAX;
+        property.unit_id = unit_id;
+        property.summary_unit_id = unit_id;
+        assert!(
+            dataset
+                .property
+                .insert(property.property_id, property)
+                .is_none()
+        );
+        dataset
+            .key
+            .get_mut(&last_key)
+            .expect("source key exists")
+            .property_id = i64::MAX;
+        let final_offset = 17;
+        dataset
+            .key_index
+            .last_mut()
+            .expect("multiple indexes")
+            .period_offset = final_offset;
+        dataset.update_table_key_indexes_mapping()?;
+        assert_eq!(
+            dataset.table_key_index_mapping[&table_name],
+            (0..dataset.key_index.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            dataset.table_units_mapping.get(&table_name),
+            Some(&("last-unit".to_owned(), final_offset))
+        );
+
+        let missing_unit = i64::MAX - 1;
+        let expected_error = dataset
+            .unit(missing_unit)
+            .expect_err("unit must be absent")
+            .to_string();
+        let mut property = dataset
+            .property(dataset.key(first_key)?.property_id)?
+            .clone();
+        property.property_id = i64::MAX - 1;
+        property.unit_id = missing_unit;
+        property.summary_unit_id = missing_unit;
+        assert!(
+            dataset
+                .property
+                .insert(property.property_id, property)
+                .is_none()
+        );
+        dataset
+            .key
+            .get_mut(&first_key)
+            .expect("source key exists")
+            .property_id = i64::MAX - 1;
+        let error = dataset
+            .update_table_key_indexes_mapping()
+            .expect_err("an earlier missing unit must fail");
+        assert_eq!(error.to_string(), expected_error);
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_key_records_produce_the_same_mapping_and_missing_keys_fail() -> Result<()> {
+        let path =
+            std::path::Path::new("tests/data/plexos-solution-files/Model_Base_LT_Solution.zip");
+        let (mut source, _) = SolutionDataset::read_zip_archive(path, "", &mut None)?;
+        let mut text = String::new();
+        source
+            .archive
+            .by_index(source.index)?
+            .read_to_string(&mut text)?;
+        let ordered = SolutionDataset::default().with_xml_string(&text)?;
+        let doc = roxmltree::Document::parse(&text)?;
+        let nodes = doc
+            .root_element()
+            .children()
+            .filter(roxmltree::Node::is_element)
+            .collect::<Vec<_>>();
+        let mut key_nodes = nodes
+            .iter()
+            .copied()
+            .filter(|node| node.tag_name().name() == "t_key")
+            .collect::<Vec<_>>();
+        let mut index_nodes = nodes
+            .iter()
+            .copied()
+            .filter(|node| node.tag_name().name() == "t_key_index")
+            .collect::<Vec<_>>();
+        assert!(key_nodes.len() > 1 && index_nodes.len() > 1);
+        let mut shuffled_text = String::with_capacity(text.len());
+        let mut previous_end = 0;
+        for node in nodes {
+            shuffled_text.push_str(&text[previous_end..node.range().start]);
+            let replacement = match node.tag_name().name() {
+                "t_key" => key_nodes.pop().expect("one replacement per key"),
+                "t_key_index" => index_nodes.pop().expect("one replacement per index"),
+                _ => node,
+            };
+            shuffled_text.push_str(&text[replacement.range()]);
+            previous_end = node.range().end;
+        }
+        shuffled_text.push_str(&text[previous_end..]);
+        let mut shuffled = SolutionDataset::default().with_xml_string(&shuffled_text)?;
+        assert_eq!(
+            ordered.table_key_index_mapping,
+            shuffled.table_key_index_mapping
+        );
+        assert_eq!(ordered.table_units_mapping, shuffled.table_units_mapping);
+        let missing = shuffled.key_index[0].key_id;
+        assert!(shuffled.key.shift_remove(&missing).is_some());
+        let error = shuffled
+            .update_table_key_indexes_mapping()
+            .expect_err("missing source key must fail");
+        assert_eq!(error.to_string(), format!("Key with {missing} not found"));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_ids_preserve_periods_objects_and_phases() -> Result<()> {
+        let text = r#"<SolutionDataset>
+            <t_key_index><key_id>21</key_id><period_type_id>1</period_type_id><position>0</position><length>2</length><period_offset>3</period_offset></t_key_index>
+            <t_key_index><key_id>21</key_id><period_type_id>4</period_type_id><position>0</position><length>1</length><period_offset>0</period_offset></t_key_index>
+            <t_attribute_data><object_id>1</object_id><attribute_id>5</attribute_id><value>10</value></t_attribute_data>
+            <t_attribute_data><object_id>2</object_id><attribute_id>5</attribute_id><value>20</value></t_attribute_data>
+            <t_attribute_data><attribute_id>5</attribute_id><value>30</value></t_attribute_data>
+            <t_attribute_data><object_id/><attribute_id>6</attribute_id><value>40</value></t_attribute_data>
+            <t_sample><sample_id>1</sample_id><sample_name>scenario</sample_name></t_sample>
+            <t_sample_weight><sample_id>1</sample_id><phase_id>3</phase_id><value>0.25</value></t_sample_weight>
+            <t_sample_weight><sample_id>1</sample_id><phase_id>4</phase_id><value>0.75</value></t_sample_weight>
+        </SolutionDataset>"#;
+        let mut dataset = SolutionDataset::default();
+        xml::read_records(text.as_bytes(), |node| {
+            dataset.parse_xml_record(node.tag_name().name(), &node)
+        })?;
+        dataset.sort_xml_records();
+        assert_eq!(dataset.key_index.len(), 2);
+        assert_eq!(dataset.attribute_data.len(), 4);
+        assert_eq!(dataset.sample_weight.len(), 2);
+
+        let mut con = duckdb::Connection::open_in_memory()?;
+        con.execute_batch("CREATE SCHEMA raw;")?;
+        dataset.populate_table_key_indexes(&mut con, &mut None)?;
+        dataset.populate_table_attribute_data(&mut con, &mut None)?;
+        dataset.populate_table_samples(&mut con, &mut None)?;
+        let indexes = con.prepare("SELECT key_id, period_type_id, position, length, period_offset FROM raw.key_indexes ORDER BY period_type_id")?
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?, row.get::<_, i64>(4)?)))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        assert_eq!(indexes, vec![(21, 1, 0, 2, 3), (21, 4, 0, 1, 0)]);
+        let attributes = con.prepare("SELECT object_id, attribute_id, value::DOUBLE FROM raw.attribute_data ORDER BY value::DOUBLE")?
+            .query_map([], |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?, row.get::<_, f64>(2)?)))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        assert_eq!(
+            attributes,
+            vec![
+                (Some(1), 5, 10.0),
+                (Some(2), 5, 20.0),
+                (None, 5, 30.0),
+                (None, 6, 40.0)
+            ]
+        );
+        let weights = con.prepare("SELECT sample_id, sample_phase_id, sample_weight FROM raw.samples ORDER BY sample_phase_id")?
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, f64>(2)?)))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        assert_eq!(weights, vec![(1, 3, 0.25), (1, 4, 0.75)]);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_key_reads_each_period_and_report_rows_are_not_duplicated() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let mut period_data = indexmap::IndexMap::new();
+        for (period, values) in [(1, vec![10.0_f64, 20.0]), (4, vec![30.0])] {
+            let path = temp_dir.path().join(format!("t_data_{period}.BIN"));
+            let mut file = std::fs::File::create(&path)?;
+            for value in values {
+                file.write_all(&value.to_le_bytes())?;
+            }
+            drop(file);
+            period_data.insert(period, std::fs::File::open(path)?);
+        }
+        let mut key = indexmap::IndexMap::with_hasher(ahash::RandomState::new());
+        key.insert(
+            21,
+            Key {
+                key_id: 21,
+                phase_id: 4,
+                is_summary: true,
+                sample_id: 1,
+                band_id: 2,
+                membership_id: 3,
+                property_id: 4,
+                model_id: 1,
+                timeslice_id: 0,
+            },
+        );
+        let dataset = SolutionDataset {
+            key,
+            key_index: vec![
+                KeyIndex {
+                    key_id: 21,
+                    period_type_id: 1,
+                    length: 2,
+                    position: 0,
+                    period_offset: 3,
+                },
+                KeyIndex {
+                    key_id: 21,
+                    period_type_id: 4,
+                    length: 1,
+                    position: 0,
+                    period_offset: 0,
+                },
+            ],
+            sample: [(
+                1,
+                Sample {
+                    sample_id: 1,
+                    name: Some("scenario".to_owned()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            sample_weight: vec![
+                SampleWeight {
+                    sample_id: 1,
+                    phase_id: 3,
+                    weight: 0.25,
+                },
+                SampleWeight {
+                    sample_id: 1,
+                    phase_id: 4,
+                    weight: 0.75,
+                },
+            ],
+            table_key_index_mapping: std::collections::HashMap::from([
+                ("ST__Day__Fixture__Metric".to_owned(), vec![0]),
+                ("ST__Year__Fixture__Metric".to_owned(), vec![1]),
+            ]),
+            ..Default::default()
+        }
+        .with_period_data(period_data);
+        let path = temp_dir.path().join("periods.duckdb");
+        dataset.to_duckdb(&path).with_data_write_threads(2).run()?;
+        let con = duckdb::Connection::open(path)?;
+        for (table, expected) in [
+            ("ST__Day__Fixture__Metric", vec![(4_i64, 10.0), (5, 20.0)]),
+            ("ST__Year__Fixture__Metric", vec![(1, 30.0)]),
+        ] {
+            let actual = con
+                .prepare(&format!(
+                    "SELECT block_id, value FROM data.\"{table}\" ORDER BY block_id"
+                ))?
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?
+                .collect::<duckdb::Result<Vec<_>>>()?;
+            assert_eq!(actual, expected);
+            let report = con
+                .prepare(&format!(
+                    "SELECT sample_name, value FROM report.\"{table}\" ORDER BY value"
+                ))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })?
+                .collect::<duckdb::Result<Vec<_>>>()?;
+            assert_eq!(
+                report,
+                expected
+                    .into_iter()
+                    .map(|(_, value)| ("scenario".to_owned(), value))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn renamed_zip_selects_solution_xml_instead_of_parameters() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let zip_path = temp_dir.path().join("renamed.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path)?);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("PLEXOS_Param.xml", options)?;
+        writer.write_all(b"<UndocumentedParam><Attributes/></UndocumentedParam>")?;
+        writer.start_file("Model actual Solution.xml", options)?;
+        writer.write_all(
+            b"<SolutionDataset xmlns=\"urn:solution\"><t_model><model_id>1</model_id><name>actual</name></t_model></SolutionDataset>",
+        )?;
+        writer.finish()?;
+
+        let dataset = SolutionDataset::default().with_zip_file(&zip_path)?;
+        assert_eq!(dataset.model.len(), 1);
+        assert_eq!(dataset.model.get(&1).expect("model exists").name, "actual");
+        Ok(())
+    }
+
+    #[test]
     fn read_zip_archive_falls_back_to_unicode_xml_name() -> Result<()> {
         let temp_dir = tempfile::TempDir::new()?;
         let zip_path = temp_dir.path().join("solution.zip");
@@ -4590,8 +5324,13 @@ mod tests {
         zip_writer.write_all(&expected)?;
         zip_writer.finish()?;
 
-        let (xml_content, period_data) =
+        let (mut source, period_data) =
             SolutionDataset::read_zip_archive(&zip_path, "absent", &mut None)?;
+        let mut xml_content = String::new();
+        source
+            .archive
+            .by_index(source.index)?
+            .read_to_string(&mut xml_content)?;
         assert_eq!(xml_content, "<root />");
         let data = period_data
             .get(&0)
@@ -4663,17 +5402,13 @@ mod tests {
 
         let (_xml_content, period_data) =
             SolutionDataset::read_zip_archive(&zip_path, "", &mut None)?;
-        let mut key_index = indexmap::IndexMap::new();
-        key_index.insert(
-            10,
-            KeyIndex {
-                key_id: 10,
-                period_type_id: 1,
-                length: 2,
-                position: 0,
-                period_offset: 0,
-            },
-        );
+        let key_index = vec![KeyIndex {
+            key_id: 10,
+            period_type_id: 1,
+            length: 2,
+            position: 0,
+            period_offset: 0,
+        }];
         let dataset = SolutionDataset {
             key_index,
             period_data,
@@ -4681,7 +5416,7 @@ mod tests {
         };
         let plans = vec![DataTableWritePlan {
             table_name: "selected_table".to_string(),
-            key_ids: vec![10],
+            index_ids: vec![0],
             estimated_values: 2,
         }];
         let mut progress: Option<&mut dyn FnMut(DuckdbProgress)> = None;
@@ -4794,7 +5529,7 @@ fn xml_record_progress_label(tag: &str) -> Option<&'static str> {
     }
 }
 
-fn sort_index_map_if_needed<K: Ord, V>(map: &mut indexmap::IndexMap<K, V>) {
+fn sort_index_map_if_needed<K: Ord, V, S>(map: &mut indexmap::IndexMap<K, V, S>) {
     if !map.keys().is_sorted() {
         map.sort_keys();
     }

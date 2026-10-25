@@ -699,7 +699,7 @@ fn lt_solution_preserves_observed_table_shapes() {
     );
 
     let data_tables = fetch_table_names(&con, "data", "BASE TABLE");
-    assert_eq!(data_tables.len(), 29, "unexpected LT data table count");
+    assert_eq!(data_tables.len(), 48, "unexpected LT data table count");
     for table in [
         "LT__Interval__Batteries__Generation",
         "LT__Interval__Batteries__Load",
@@ -724,7 +724,7 @@ fn lt_solution_preserves_observed_table_shapes() {
     }
 
     let report_views = fetch_table_names(&con, "report", "VIEW");
-    assert_eq!(report_views.len(), 29, "unexpected LT report view count");
+    assert_eq!(report_views.len(), 48, "unexpected LT report view count");
     assert_report_view_shape(&con, "LT__Interval__Batteries__Generation", "Generation");
     assert_report_view_shape(&con, "LT__Interval__Batteries__Load", "Load");
     assert_report_view_shape(
@@ -772,7 +772,7 @@ fn st_solution_preserves_observed_table_shapes() {
     );
 
     let data_tables = fetch_table_names(&con, "data", "BASE TABLE");
-    assert_eq!(data_tables.len(), 53, "unexpected ST data table count");
+    assert_eq!(data_tables.len(), 77, "unexpected ST data table count");
     for table in [
         "ST__Interval__Batteries__Generation",
         "ST__Interval__Batteries__Load",
@@ -797,7 +797,7 @@ fn st_solution_preserves_observed_table_shapes() {
     }
 
     let report_views = fetch_table_names(&con, "report", "VIEW");
-    assert_eq!(report_views.len(), 53, "unexpected ST report view count");
+    assert_eq!(report_views.len(), 77, "unexpected ST report view count");
     assert_report_view_shape(&con, "ST__Interval__Batteries__Generation", "Generation");
     assert_report_view_shape(&con, "ST__Interval__Batteries__Load", "Load");
     assert_report_view_shape(
