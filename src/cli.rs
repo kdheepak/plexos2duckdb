@@ -120,17 +120,31 @@ enum ConvertJsonEvent {
         keys: usize,
     },
     DataTableEnd,
+    DataWriteStart {
+        rows: u64,
+        partitions: usize,
+        workers: usize,
+    },
     DataWorkerTableStart {
         worker_id: usize,
         index: usize,
-        total: usize,
         table_name: String,
         keys: usize,
+        rows: u64,
+    },
+    DataWorkerTableProgress {
+        worker_id: usize,
+        index: usize,
+        rows: u64,
     },
     DataWorkerTableEnd {
         worker_id: usize,
         index: usize,
-        total: usize,
+        rows: u64,
+    },
+    DataWorkerFinished {
+        worker_id: usize,
+        completed: usize,
     },
     DataMergeTableStart {
         index: usize,
@@ -428,6 +442,9 @@ fn convert(args: ConvertArgs) -> Result<()> {
     let mut pb = None;
     let mut data_tables_pb = None;
     let mut data_merge_pb = None;
+    let mut data_rows_pb = None;
+    let mut data_parts_pb = None;
+    let mut active_data_workers = 0usize;
     let mut worker_tables_pb: std::collections::BTreeMap<usize, ProgressBar> =
         std::collections::BTreeMap::new();
     let mut current_table = None;
@@ -509,27 +526,52 @@ fn convert(args: ConvertArgs) -> Result<()> {
                     keys,
                 },
                 plexos2duckdb::ProgressEvent::DataTableEnd => ConvertJsonEvent::DataTableEnd,
+                plexos2duckdb::ProgressEvent::DataWriteStart {
+                    rows,
+                    partitions,
+                    workers,
+                } => ConvertJsonEvent::DataWriteStart {
+                    rows,
+                    partitions,
+                    workers,
+                },
                 plexos2duckdb::ProgressEvent::DataWorkerTableStart {
                     worker_id,
                     index,
-                    total,
                     table_name,
                     keys,
+                    rows,
                 } => ConvertJsonEvent::DataWorkerTableStart {
                     worker_id,
                     index,
-                    total,
                     table_name,
                     keys,
+                    rows,
+                },
+                plexos2duckdb::ProgressEvent::DataWorkerTableProgress {
+                    worker_id,
+                    index,
+                    rows,
+                } => ConvertJsonEvent::DataWorkerTableProgress {
+                    worker_id,
+                    index,
+                    rows,
                 },
                 plexos2duckdb::ProgressEvent::DataWorkerTableEnd {
                     worker_id,
                     index,
-                    total,
+                    rows,
                 } => ConvertJsonEvent::DataWorkerTableEnd {
                     worker_id,
                     index,
-                    total,
+                    rows,
+                },
+                plexos2duckdb::ProgressEvent::DataWorkerFinished {
+                    worker_id,
+                    completed,
+                } => ConvertJsonEvent::DataWorkerFinished {
+                    worker_id,
+                    completed,
                 },
                 plexos2duckdb::ProgressEvent::DataMergeTableStart {
                     index,
@@ -590,42 +632,104 @@ fn convert(args: ConvertArgs) -> Result<()> {
                     }
                 }
             },
+            plexos2duckdb::ProgressEvent::DataWriteStart {
+                rows,
+                partitions,
+                workers,
+            } => {
+                active_data_workers = workers;
+                if let Some(multi) = mp.as_ref() {
+                    let rows_bar = multi.add(ProgressBar::new(rows));
+                    rows_bar.set_style(
+                        ProgressStyle::with_template(
+                            "{prefix:>9.bold} {bar:20.cyan/blue} {percent:>3}% {human_pos}/{human_len} rows {elapsed_precise:.dim}",
+                        )
+                        .unwrap(),
+                    );
+                    rows_bar.set_prefix("write");
+                    rows_bar.enable_steady_tick(Duration::from_millis(200));
+                    data_rows_pb = Some(rows_bar);
+
+                    let parts_bar = multi.add(ProgressBar::new(partitions as u64));
+                    parts_bar.set_style(
+                        ProgressStyle::with_template(
+                            "{prefix:>9.bold} {pos}/{len} complete  {msg:.dim}",
+                        )
+                        .unwrap(),
+                    );
+                    parts_bar.set_prefix("parts");
+                    parts_bar.set_message(format!("{active_data_workers} workers active"));
+                    data_parts_pb = Some(parts_bar);
+                }
+            },
             plexos2duckdb::ProgressEvent::DataWorkerTableStart {
                 worker_id,
                 index,
-                total,
                 table_name,
                 keys,
+                rows,
             } => {
                 if !worker_tables_pb.contains_key(&worker_id) {
                     if let Some(multi) = mp.as_ref() {
-                        let bar = multi.add(ProgressBar::new(total as u64));
+                        let bar = multi.add(ProgressBar::new(rows));
                         bar.set_style(
                             ProgressStyle::with_template(
-                                "{prefix:>9.bold} {bar:10.green/blue} {pos:>2}/{len:2} {elapsed_precise:.dim} {msg:.green}",
+                                "{prefix:>9.bold} {bar:20.green/blue} {percent:>3}% {human_pos}/{human_len} rows {elapsed_precise:.dim}\n           {wide_msg:.green}",
                             )
                             .unwrap(),
                         );
                         bar.set_prefix(format!("thread-{}", worker_id + 1));
+                        bar.enable_steady_tick(Duration::from_millis(200));
                         worker_tables_pb.insert(worker_id, bar);
                     }
                 }
                 if let Some(bar) = worker_tables_pb.get(&worker_id) {
-                    bar.set_length(total as u64);
-                    bar.set_position(index.saturating_sub(1) as u64);
-                    bar.set_message(format!("{table_name} ({keys} keys)"));
+                    bar.reset();
+                    bar.set_length(rows);
+                    bar.set_message(format!(
+                        "{table_name} ({keys} keys; {} tasks completed)",
+                        index.saturating_sub(1)
+                    ));
+                }
+            },
+            plexos2duckdb::ProgressEvent::DataWorkerTableProgress {
+                worker_id, rows, ..
+            } => {
+                if let Some(bar) = worker_tables_pb.get(&worker_id) {
+                    bar.set_position(rows);
                 }
             },
             plexos2duckdb::ProgressEvent::DataWorkerTableEnd {
                 worker_id,
                 index,
-                total,
+                rows,
             } => {
                 if let Some(bar) = worker_tables_pb.get(&worker_id) {
-                    bar.set_length(total as u64);
-                    bar.set_position(index as u64);
-                    if index == total {
-                        bar.set_message("done");
+                    bar.set_position(rows);
+                    bar.set_message(format!("{index} tasks completed; waiting for work"));
+                }
+                if let Some(bar) = data_rows_pb.as_ref() {
+                    bar.inc(rows);
+                }
+                if let Some(bar) = data_parts_pb.as_ref() {
+                    bar.inc(1);
+                }
+            },
+            plexos2duckdb::ProgressEvent::DataWorkerFinished {
+                worker_id,
+                completed,
+            } => {
+                if let Some(bar) = worker_tables_pb.get(&worker_id) {
+                    bar.finish_with_message(format!("{completed} tasks completed"));
+                }
+                active_data_workers -= 1;
+                if let Some(bar) = data_parts_pb.as_ref() {
+                    bar.set_message(format!("{active_data_workers} workers active"));
+                    if active_data_workers == 0 && bar.position() == bar.length().unwrap_or(0) {
+                        bar.finish();
+                        if let Some(rows_bar) = data_rows_pb.as_ref() {
+                            rows_bar.finish();
+                        }
                     }
                 }
             },
@@ -771,6 +875,12 @@ fn convert(args: ConvertArgs) -> Result<()> {
         for bar in worker_tables_pb.values() {
             bar.finish_and_clear();
         }
+        if let Some(bar) = data_rows_pb.as_ref() {
+            bar.finish_and_clear();
+        }
+        if let Some(bar) = data_parts_pb.as_ref() {
+            bar.finish_and_clear();
+        }
         print_total_time(start_time);
         dataset.print_summary();
         return Ok(());
@@ -823,6 +933,12 @@ fn convert(args: ConvertArgs) -> Result<()> {
         bar.finish_and_clear();
     }
     for bar in worker_tables_pb.values() {
+        bar.finish_and_clear();
+    }
+    if let Some(bar) = data_rows_pb.as_ref() {
+        bar.finish_and_clear();
+    }
+    if let Some(bar) = data_parts_pb.as_ref() {
         bar.finish_and_clear();
     }
     print_total_time(start_time);

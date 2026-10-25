@@ -884,17 +884,31 @@ pub enum ProgressEvent {
         keys: usize,
     },
     DataTableEnd,
+    DataWriteStart {
+        rows: u64,
+        partitions: usize,
+        workers: usize,
+    },
     DataWorkerTableStart {
         worker_id: usize,
         index: usize,
-        total: usize,
         table_name: String,
         keys: usize,
+        rows: u64,
+    },
+    DataWorkerTableProgress {
+        worker_id: usize,
+        index: usize,
+        rows: u64,
     },
     DataWorkerTableEnd {
         worker_id: usize,
         index: usize,
-        total: usize,
+        rows: u64,
+    },
+    DataWorkerFinished {
+        worker_id: usize,
+        completed: usize,
     },
     DataMergeTableStart {
         index: usize,
@@ -920,6 +934,36 @@ struct DataTableWritePlan {
     estimated_values: u128,
 }
 
+struct DataWriteQueue {
+    plans: std::sync::Mutex<std::vec::IntoIter<DataTableWritePlan>>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl DataWriteQueue {
+    fn new(plans: Vec<DataTableWritePlan>) -> Self {
+        Self {
+            plans: std::sync::Mutex::new(plans.into_iter()),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn next(&self) -> Result<Option<DataTableWritePlan>> {
+        let mut plans = self
+            .plans
+            .lock()
+            .map_err(|_| eyre!("Data write queue lock poisoned"))?;
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(plans.next())
+    }
+
+    fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug)]
 struct MaterializedPeriodDataFiles {
     _dir: tempfile::TempDir,
@@ -931,16 +975,25 @@ enum DataWriteWorkerEvent {
     TableStarted {
         worker_id: usize,
         index: usize,
-        total: usize,
         table_name: String,
         keys: usize,
+        rows: u64,
+    },
+    TableProgress {
+        worker_id: usize,
+        index: usize,
+        rows: u64,
     },
     TableCompleted {
         worker_id: usize,
         index: usize,
-        total: usize,
         table_name: String,
         keys: usize,
+        rows: u64,
+    },
+    Finished {
+        worker_id: usize,
+        completed: usize,
     },
 }
 
@@ -2687,8 +2740,8 @@ impl SolutionDataset {
         plans: Vec<DataTableWritePlan>,
         worker_count: usize,
     ) -> Result<Vec<DataTableWritePlan>> {
-        if worker_count <= 1 {
-            return Ok(plans);
+        if worker_count == 0 {
+            return Err(eyre!("Data write worker count must be positive"));
         }
         let total_values = plans.iter().try_fold(0u128, |total, plan| {
             total
@@ -2696,9 +2749,10 @@ impl SolutionDataset {
                 .ok_or_else(|| eyre!("Estimated data write workload overflow"))
         })?;
         const PARTITIONS_PER_WORKER: u128 = 4;
+        const MAX_PARTITION_VALUES: u128 = 16_000_000;
         let target_values = total_values
             .div_ceil(worker_count as u128 * PARTITIONS_PER_WORKER)
-            .max(u128::from(DATA_APPEND_BATCH_VALUES));
+            .clamp(u128::from(DATA_APPEND_BATCH_VALUES), MAX_PARTITION_VALUES);
         let mut partitions = Vec::new();
         for plan in plans {
             if plan.estimated_values <= target_values || plan.index_ids.len() < 2 {
@@ -2708,7 +2762,8 @@ impl SolutionDataset {
             let mut index_ids = Vec::new();
             let mut estimated_values = 0u128;
             for index_id in plan.index_ids {
-                if estimated_values >= target_values {
+                let length = u128::from(self.key_index(index_id)?.length);
+                if !index_ids.is_empty() && estimated_values + length > target_values {
                     partitions.push(DataTableWritePlan {
                         table_name: plan.table_name.clone(),
                         index_ids: std::mem::take(&mut index_ids),
@@ -2716,7 +2771,7 @@ impl SolutionDataset {
                     });
                     estimated_values = 0;
                 }
-                estimated_values += u128::from(self.key_index(index_id)?.length);
+                estimated_values += length;
                 index_ids.push(index_id);
             }
             partitions.push(DataTableWritePlan {
@@ -2801,6 +2856,16 @@ impl SolutionDataset {
         )))
     }
 
+    fn planned_data_rows(plans: &[DataTableWritePlan]) -> Result<u64> {
+        plans.iter().try_fold(0u64, |total, plan| {
+            let rows = u64::try_from(plan.estimated_values)
+                .map_err(|_| eyre!("Row count exceeds u64 for table '{}'", plan.table_name))?;
+            total
+                .checked_add(rows)
+                .ok_or_else(|| eyre!("Total data row count exceeds u64"))
+        })
+    }
+
     fn populate_table_data_direct(
         &self,
         con: &duckdb::Connection,
@@ -2813,92 +2878,104 @@ impl SolutionDataset {
         let total_tasks = plans.iter().map(|plan| plan.index_ids.len().max(1)).sum();
         let worker_count = Self::resolve_data_write_threads(total_tasks, configured_threads);
         let plans = self.partition_data_table_plans(plans, worker_count)?;
+        let worker_count = worker_count.min(plans.len());
+        let total_rows = Self::planned_data_rows(&plans)?;
         let mut table_progress = std::collections::BTreeMap::<String, (usize, usize)>::new();
         for plan in &plans {
             let (remaining_parts, _) = table_progress.entry(plan.table_name.clone()).or_default();
             *remaining_parts += 1;
         }
-        let worker_plans = Self::distribute_data_table_plans(plans, worker_count);
         Self::report_duckdb_progress(
             progress,
             &format!(
-                "Writing BIN tables directly to DuckDB with {} workers",
-                worker_plans.len()
+                "Writing BIN tables directly to DuckDB with {worker_count} workers ({} partitions)",
+                plans.len()
             ),
         );
-
+        con.execute_batch(
+            "SET preserve_insertion_order = false;
+             SET threads = 1;",
+        )?;
+        let worker_connections = (0..worker_count)
+            .map(|_| con.try_clone())
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        if let Some(report) = progress.as_mut() {
+            report(DuckdbProgress::Event(ProgressEvent::DataWriteStart {
+                rows: total_rows,
+                partitions: plans.len(),
+                workers: worker_count,
+            }));
+        }
+        let queue = DataWriteQueue::new(plans);
         let (tx, rx) = std::sync::mpsc::channel::<DataWriteWorkerEvent>();
         std::thread::scope(|scope| -> Result<()> {
-            let mut handles = Vec::with_capacity(worker_plans.len());
-            for (worker_idx, worker_plan) in worker_plans.into_iter().enumerate() {
+            let mut handles = Vec::with_capacity(worker_count);
+            for (worker_idx, worker_con) in worker_connections.into_iter().enumerate() {
                 let worker_tx = tx.clone();
-                let worker_con = con.try_clone()?;
+                let queue = &queue;
                 handles.push(scope.spawn(move || -> Result<()> {
-                    worker_con.execute_batch(
-                        "SET preserve_insertion_order = false;
-                         SET threads = 1;",
-                    )?;
-                    self.write_data_table_plans_to_duckdb(
+                    let result = self.write_data_table_plans_to_duckdb(
                         worker_idx,
-                        worker_plan,
+                        queue,
                         &worker_con,
                         materialized_period_data,
                         &worker_tx,
-                    )
+                    );
+                    if result.is_err() {
+                        queue.cancel();
+                    }
+                    result
                 }));
             }
             drop(tx);
 
             let mut completed_tables = 0usize;
-            while completed_tables < total_tables {
-                let event = match rx.recv() {
-                    Ok(event) => event,
-                    Err(_) => {
-                        for (worker_idx, handle) in handles.into_iter().enumerate() {
-                            let result = handle
-                                .join()
-                                .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?;
-                            if let Err(err) = result {
-                                return Err(eyre!("Data worker {} failed: {err}", worker_idx + 1));
-                            }
-                        }
-                        return Err(eyre!(
-                            "Worker progress channel closed before all tables completed ({}/{})",
-                            completed_tables,
-                            total_tables
-                        ));
-                    },
-                };
+            for event in rx {
                 match event {
                     DataWriteWorkerEvent::TableStarted {
                         worker_id,
                         index,
-                        total,
                         table_name,
                         keys,
+                        rows,
                     } => {
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableStart {
                                 worker_id,
                                 index,
-                                total,
                                 table_name,
                                 keys,
+                                rows,
                             }));
+                        }
+                    },
+                    DataWriteWorkerEvent::TableProgress {
+                        worker_id,
+                        index,
+                        rows,
+                    } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(
+                                ProgressEvent::DataWorkerTableProgress {
+                                    worker_id,
+                                    index,
+                                    rows,
+                                },
+                            ));
                         }
                     },
                     DataWriteWorkerEvent::TableCompleted {
                         worker_id,
                         index,
-                        total,
                         table_name,
                         keys,
+                        rows,
                     } => {
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableEnd {
                                 worker_id,
                                 index,
-                                total,
+                                rows,
                             }));
                         }
 
@@ -2924,14 +3001,37 @@ impl SolutionDataset {
                             report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
                         }
                     },
+                    DataWriteWorkerEvent::Finished {
+                        worker_id,
+                        completed,
+                    } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerFinished {
+                                worker_id,
+                                completed,
+                            }));
+                        }
+                    },
                 }
             }
 
-            for (worker_idx, handle) in handles.into_iter().enumerate() {
-                handle
-                    .join()
-                    .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?
-                    .map_err(|err| eyre!("Data worker {} failed: {err}", worker_idx + 1))?;
+            let results = handles
+                .into_iter()
+                .enumerate()
+                .map(|(worker_idx, handle)| {
+                    handle
+                        .join()
+                        .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?
+                        .map_err(|err| eyre!("Data worker {} failed: {err}", worker_idx + 1))
+                })
+                .collect::<Vec<_>>();
+            for result in results {
+                result?;
+            }
+            if completed_tables != total_tables {
+                return Err(eyre!(
+                    "Data workers stopped before all tables completed ({completed_tables}/{total_tables})"
+                ));
             }
             Ok(())
         })
@@ -2940,23 +3040,26 @@ impl SolutionDataset {
     fn write_data_table_plans_to_duckdb(
         &self,
         worker_idx: usize,
-        worker_plan: Vec<DataTableWritePlan>,
+        queue: &DataWriteQueue,
         con: &duckdb::Connection,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         worker_tx: &std::sync::mpsc::Sender<DataWriteWorkerEvent>,
     ) -> Result<()> {
-        let worker_total = worker_plan.len();
-        for (worker_table_idx, table_plan) in worker_plan.into_iter().enumerate() {
-            let worker_table_index = worker_table_idx + 1;
+        let mut completed = 0;
+        while let Some(table_plan) = queue.next()? {
+            let worker_table_index = completed + 1;
             let table_name = table_plan.table_name.clone();
             let keys = table_plan.index_ids.len();
-            let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
-                worker_id: worker_idx,
-                index: worker_table_index,
-                total: worker_total,
-                table_name: table_name.clone(),
-                keys,
-            });
+            let rows = u64::try_from(table_plan.estimated_values)?;
+            worker_tx
+                .send(DataWriteWorkerEvent::TableStarted {
+                    worker_id: worker_idx,
+                    index: worker_table_index,
+                    table_name: table_name.clone(),
+                    keys,
+                    rows,
+                })
+                .map_err(|_| eyre!("Data write progress receiver stopped"))?;
 
             con.execute_batch("BEGIN TRANSACTION;")?;
             let mut appender = con.appender_to_db(&table_name, "data")?;
@@ -2964,19 +3067,37 @@ impl SolutionDataset {
                 &mut appender,
                 &table_plan,
                 materialized_period_data,
+                |rows| {
+                    worker_tx
+                        .send(DataWriteWorkerEvent::TableProgress {
+                            worker_id: worker_idx,
+                            index: worker_table_index,
+                            rows,
+                        })
+                        .map_err(|_| eyre!("Data write progress receiver stopped"))
+                },
             )?;
             appender.flush()?;
             drop(appender);
             con.execute_batch("COMMIT;")?;
+            completed = worker_table_index;
 
-            let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
-                worker_id: worker_idx,
-                index: worker_table_index,
-                total: worker_total,
-                table_name,
-                keys,
-            });
+            worker_tx
+                .send(DataWriteWorkerEvent::TableCompleted {
+                    worker_id: worker_idx,
+                    index: worker_table_index,
+                    table_name,
+                    keys,
+                    rows,
+                })
+                .map_err(|_| eyre!("Data write progress receiver stopped"))?;
         }
+        worker_tx
+            .send(DataWriteWorkerEvent::Finished {
+                worker_id: worker_idx,
+                completed,
+            })
+            .map_err(|_| eyre!("Data write progress receiver stopped"))?;
         Ok(())
     }
 
@@ -2985,11 +3106,17 @@ impl SolutionDataset {
         appender: &mut duckdb::Appender<'_>,
         plan: &DataTableWritePlan,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
+        report_rows: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        self.write_data_table_batches(plan, materialized_period_data, |record_batch| {
-            appender.append_record_batch(record_batch)?;
-            Ok(())
-        })
+        self.write_data_table_batches(
+            plan,
+            materialized_period_data,
+            |record_batch| {
+                appender.append_record_batch(record_batch)?;
+                Ok(())
+            },
+            report_rows,
+        )
     }
 
     fn populate_table_data_external_parquet(
@@ -3002,6 +3129,7 @@ impl SolutionDataset {
         progress: &mut Option<&mut dyn FnMut(DuckdbProgress)>,
     ) -> Result<()> {
         let total_tables = plans.len();
+        let total_rows = Self::planned_data_rows(&plans)?;
         let worker_plans = Self::distribute_data_table_plans(plans, worker_count);
         Self::report_duckdb_progress(
             progress,
@@ -3010,6 +3138,13 @@ impl SolutionDataset {
                 worker_plans.len()
             ),
         );
+        if let Some(report) = progress.as_mut() {
+            report(DuckdbProgress::Event(ProgressEvent::DataWriteStart {
+                rows: total_rows,
+                partitions: total_tables,
+                workers: worker_plans.len(),
+            }));
+        }
 
         std::fs::create_dir_all(external_data_parquet_dir)?;
         let parquet_root = external_data_parquet_dir.canonicalize()?;
@@ -3037,55 +3172,52 @@ impl SolutionDataset {
             drop(tx);
 
             let mut completed_tables = 0usize;
-            while completed_tables < total_tables {
-                let event = match rx.recv() {
-                    Ok(event) => event,
-                    Err(_) => {
-                        for (worker_idx, handle) in handles.into_iter().enumerate() {
-                            let result = handle
-                                .join()
-                                .map_err(|_| eyre!("Data worker {} panicked", worker_idx + 1))?;
-                            if let Err(err) = result {
-                                return Err(eyre!("Data worker {} failed: {err}", worker_idx + 1));
-                            }
-                        }
-                        return Err(eyre!(
-                            "Worker progress channel closed before all tables completed ({}/{})",
-                            completed_tables,
-                            total_tables
-                        ));
-                    },
-                };
+            for event in rx {
                 match event {
                     DataWriteWorkerEvent::TableStarted {
                         worker_id,
                         index,
-                        total,
                         table_name,
                         keys,
+                        rows,
                     } => {
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableStart {
                                 worker_id,
                                 index,
-                                total,
                                 table_name,
                                 keys,
+                                rows,
                             }));
+                        }
+                    },
+                    DataWriteWorkerEvent::TableProgress {
+                        worker_id,
+                        index,
+                        rows,
+                    } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(
+                                ProgressEvent::DataWorkerTableProgress {
+                                    worker_id,
+                                    index,
+                                    rows,
+                                },
+                            ));
                         }
                     },
                     DataWriteWorkerEvent::TableCompleted {
                         worker_id,
                         index,
-                        total,
                         table_name,
                         keys,
+                        rows,
                     } => {
                         if let Some(report) = progress.as_mut() {
                             report(DuckdbProgress::Event(ProgressEvent::DataWorkerTableEnd {
                                 worker_id,
                                 index,
-                                total,
+                                rows,
                             }));
                         }
 
@@ -3100,6 +3232,17 @@ impl SolutionDataset {
                             report(DuckdbProgress::Event(ProgressEvent::DataTableEnd));
                         }
                     },
+                    DataWriteWorkerEvent::Finished {
+                        worker_id,
+                        completed,
+                    } => {
+                        if let Some(report) = progress.as_mut() {
+                            report(DuckdbProgress::Event(ProgressEvent::DataWorkerFinished {
+                                worker_id,
+                                completed,
+                            }));
+                        }
+                    },
                 }
             }
 
@@ -3112,6 +3255,11 @@ impl SolutionDataset {
                 staged_files.push(
                     result.map_err(|err| eyre!("Data worker {} failed: {err}", worker_idx + 1))?,
                 );
+            }
+            if completed_tables != total_tables {
+                return Err(eyre!(
+                    "Data workers stopped before all tables completed ({completed_tables}/{total_tables})"
+                ));
             }
             Ok(staged_files)
         })?;
@@ -3159,12 +3307,13 @@ impl SolutionDataset {
             let worker_table_index = worker_table_idx + 1;
             let table_name = table_plan.table_name.clone();
             let keys = table_plan.index_ids.len();
+            let rows = u64::try_from(table_plan.estimated_values)?;
             let _ = worker_tx.send(DataWriteWorkerEvent::TableStarted {
                 worker_id: worker_idx,
                 index: worker_table_index,
-                total: worker_total,
                 table_name: table_name.clone(),
                 keys,
+                rows,
             });
 
             let table_dir_name = Self::external_data_table_dir_name(&table_name);
@@ -3172,7 +3321,20 @@ impl SolutionDataset {
             std::fs::create_dir_all(&table_dir)?;
             let parquet_path = table_dir.join(format!("{table_dir_name}.part-00001.parquet"));
             let mut writer = Self::open_data_parquet_writer(&parquet_path)?;
-            self.write_data_table_to_parquet(&mut writer, &table_plan, materialized_period_data)?;
+            self.write_data_table_to_parquet(
+                &mut writer,
+                &table_plan,
+                materialized_period_data,
+                |rows| {
+                    worker_tx
+                        .send(DataWriteWorkerEvent::TableProgress {
+                            worker_id: worker_idx,
+                            index: worker_table_index,
+                            rows,
+                        })
+                        .map_err(|_| eyre!("Data write progress receiver stopped"))
+                },
+            )?;
             writer.close()?;
 
             table_files
@@ -3183,11 +3345,15 @@ impl SolutionDataset {
             let _ = worker_tx.send(DataWriteWorkerEvent::TableCompleted {
                 worker_id: worker_idx,
                 index: worker_table_index,
-                total: worker_total,
                 table_name,
                 keys,
+                rows,
             });
         }
+        let _ = worker_tx.send(DataWriteWorkerEvent::Finished {
+            worker_id: worker_idx,
+            completed: worker_total,
+        });
 
         Ok(table_files)
     }
@@ -3197,11 +3363,17 @@ impl SolutionDataset {
         writer: &mut ArrowWriter<std::fs::File>,
         plan: &DataTableWritePlan,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
+        report_rows: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        self.write_data_table_batches(plan, materialized_period_data, |record_batch| {
-            writer.write(&record_batch)?;
-            Ok(())
-        })
+        self.write_data_table_batches(
+            plan,
+            materialized_period_data,
+            |record_batch| {
+                writer.write(&record_batch)?;
+                Ok(())
+            },
+            report_rows,
+        )
     }
 
     fn write_data_table_batches(
@@ -3209,9 +3381,24 @@ impl SolutionDataset {
         plan: &DataTableWritePlan,
         materialized_period_data: Option<&MaterializedPeriodDataFiles>,
         mut write_batch: impl FnMut(RecordBatch) -> Result<()>,
+        mut report_rows: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         let mut chunk_buf = vec![0u8; (DATA_APPEND_BATCH_VALUES as usize) * 8];
         let mut batches = data_batches::Buffer::new(DATA_APPEND_BATCH_VALUES as usize);
+        let mut written_rows = 0u64;
+        let mut last_report = std::time::Instant::now();
+        let mut write_and_report = |batch: RecordBatch| {
+            let rows = batch.num_rows() as u64;
+            write_batch(batch)?;
+            written_rows = written_rows
+                .checked_add(rows)
+                .ok_or_else(|| eyre!("Written data row count exceeds u64"))?;
+            if last_report.elapsed() >= std::time::Duration::from_millis(200) {
+                report_rows(written_rows)?;
+                last_report = std::time::Instant::now();
+            }
+            Ok(())
+        };
         for index_id in plan.index_ids.iter().copied() {
             let ki = self.key_index(index_id)?;
             let key_id = ki.key_id;
@@ -3240,11 +3427,11 @@ impl SolutionDataset {
                 &task,
                 materialized_period_data,
                 &mut chunk_buf,
-                |batch| batches.push(batch, &mut write_batch),
+                |batch| batches.push(batch, &mut write_and_report),
             )?;
         }
 
-        batches.flush(&mut write_batch)
+        batches.flush(&mut write_and_report)
     }
 
     fn open_data_parquet_writer(path: &std::path::Path) -> Result<ArrowWriter<std::fs::File>> {
